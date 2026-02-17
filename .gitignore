@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+secrets/
+
+# Sync files (sensitive)
+token.pickle
+sync_metadata.json
+.env
