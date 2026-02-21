@@ -2,14 +2,16 @@ import os
 import json
 import time
 import pickle
+import threading
+import io
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
-import io
 
 # --- CONFIGURATION ---
 LOCAL_FOLDER = "/home/aritrarc1/GDrive"
@@ -17,7 +19,8 @@ SCOPES = ['https://www.googleapis.com/auth/drive']
 CREDS_FILE = 'secrets/client_secret_116989766183-v0e50u650rdhah0j933fsloke77hp1od.apps.googleusercontent.com.json'
 TOKEN_FILE = 'token.pickle'
 METADATA_FILE = 'sync_metadata.json'
-DRIVE_FOLDER_NAME = 'GDriveSync'  # Root folder name in Google Drive
+DRIVE_FOLDER_NAME = 'Obsidian'  # Root folder name in Google Drive
+MAX_WORKERS = 10  # Max parallel threads for API calls (tune to avoid rate limits)
 
 class GoogleDriveSync:
     """Bidirectional Google Drive sync with interval-based syncing."""
@@ -30,15 +33,18 @@ class GoogleDriveSync:
             sync_interval: Time in seconds between sync operations (default: 300 = 5 minutes)
         """
         self.sync_interval = sync_interval
-        self.service = self.authenticate()
+        self.creds = self._get_credentials()
+        self.service = build('drive', 'v3', credentials=self.creds)
+        self._thread_local = threading.local()  # Thread-local service objects
         self.drive_root_id = self._get_or_create_drive_folder()
         self.metadata = self._load_metadata()
+        self._metadata_lock = threading.Lock()  # Protects self.metadata in threads
         
         # Ensure local folder exists
         os.makedirs(LOCAL_FOLDER, exist_ok=True)
         
-    def authenticate(self):
-        """Authenticate with Google Drive using OAuth."""
+    def _get_credentials(self):
+        """Get or refresh OAuth credentials."""
         creds = None
         
         # Load existing token if it exists
@@ -66,7 +72,13 @@ class GoogleDriveSync:
                 pickle.dump(creds, token)
             print("✅ Authentication successful!")
         
-        return build('drive', 'v3', credentials=creds)
+        return creds
+    
+    def _get_thread_service(self):
+        """Get a thread-local Google Drive service (httplib2 is NOT thread-safe)."""
+        if not hasattr(self._thread_local, 'service'):
+            self._thread_local.service = build('drive', 'v3', credentials=self.creds)
+        return self._thread_local.service
     
     def _get_or_create_drive_folder(self) -> str:
         """Get or create the root sync folder in Google Drive."""
@@ -127,12 +139,13 @@ class GoogleDriveSync:
     
     def _get_or_create_drive_folder_path(self, folder_path: List[str]) -> str:
         """Get or create nested folders in Drive, return final folder ID."""
+        service = self._get_thread_service()
         parent_id = self.drive_root_id
         
         for folder_name in folder_path:
             # Search for folder
             query = f"name='{folder_name}' and '{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            results = self.service.files().list(
+            results = service.files().list(
                 q=query,
                 spaces='drive',
                 fields='files(id, name)'
@@ -149,7 +162,7 @@ class GoogleDriveSync:
                     'mimeType': 'application/vnd.google-apps.folder',
                     'parents': [parent_id]
                 }
-                folder = self.service.files().create(
+                folder = service.files().create(
                     body=file_metadata,
                     fields='id'
                 ).execute()
@@ -163,6 +176,8 @@ class GoogleDriveSync:
         file_name = os.path.basename(local_path)
         
         try:
+            service = self._get_thread_service()
+            
             # Get modification time
             mtime = os.path.getmtime(local_path)
             
@@ -172,7 +187,7 @@ class GoogleDriveSync:
             
             # Check if file already exists in Drive
             query = f"name='{file_name}' and '{parent_id}' in parents and trashed=false"
-            results = self.service.files().list(
+            results = service.files().list(
                 q=query,
                 spaces='drive',
                 fields='files(id, name, modifiedTime)'
@@ -186,7 +201,7 @@ class GoogleDriveSync:
             if files:
                 # Update existing file
                 file_id = files[0]['id']
-                file = self.service.files().update(
+                file = service.files().update(
                     fileId=file_id,
                     media_body=media,
                     fields='id, modifiedTime'
@@ -194,19 +209,20 @@ class GoogleDriveSync:
                 print(f"📤 Updated: {rel_path}")
             else:
                 # Create new file
-                file = self.service.files().create(
+                file = service.files().create(
                     body=file_metadata,
                     media_body=media,
                     fields='id, modifiedTime'
                 ).execute()
                 print(f"📤 Uploaded: {rel_path}")
             
-            # Update metadata
-            self.metadata['files'][rel_path] = {
-                'mtime': mtime,
-                'drive_id': file['id'],
-                'drive_mtime': file.get('modifiedTime')
-            }
+            # Update metadata (thread-safe)
+            with self._metadata_lock:
+                self.metadata['files'][rel_path] = {
+                    'mtime': mtime,
+                    'drive_id': file['id'],
+                    'drive_mtime': file.get('modifiedTime')
+                }
             
         except Exception as e:
             print(f"❌ Error uploading {rel_path}: {e}")
@@ -214,7 +230,8 @@ class GoogleDriveSync:
     def _download_file(self, file_id: str, file_name: str, local_path: str, drive_mtime: str):
         """Download a file from Google Drive."""
         try:
-            request = self.service.files().get_media(fileId=file_id)
+            service = self._get_thread_service()
+            request = service.files().get_media(fileId=file_id)
             
             # Ensure parent directory exists
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
@@ -233,13 +250,14 @@ class GoogleDriveSync:
             rel_path = self._get_relative_path(local_path)
             print(f"📥 Downloaded: {rel_path}")
             
-            # Update metadata
+            # Update metadata (thread-safe)
             mtime = os.path.getmtime(local_path)
-            self.metadata['files'][rel_path] = {
-                'mtime': mtime,
-                'drive_id': file_id,
-                'drive_mtime': drive_mtime
-            }
+            with self._metadata_lock:
+                self.metadata['files'][rel_path] = {
+                    'mtime': mtime,
+                    'drive_id': file_id,
+                    'drive_mtime': drive_mtime
+                }
             
         except Exception as e:
             print(f"❌ Error downloading {file_name}: {e}")
@@ -255,16 +273,22 @@ class GoogleDriveSync:
         return local_files
     
     def _scan_drive_files(self, folder_id: str = None, prefix: str = '') -> Dict[str, Dict]:
-        """Recursively scan Drive folder and return dict of files with metadata."""
+        """Recursively scan Drive folder and return dict of files with metadata.
+        
+        Subfolders are scanned in parallel using a thread pool for speed.
+        """
         if folder_id is None:
             folder_id = self.drive_root_id
         
         drive_files = {}
+        subfolders = []  # Collect (folder_id, folder_path) for parallel scan
         page_token = None
+        
+        service = self._get_thread_service()
         
         while True:
             query = f"'{folder_id}' in parents and trashed=false"
-            results = self.service.files().list(
+            results = service.files().list(
                 q=query,
                 spaces='drive',
                 fields='nextPageToken, files(id, name, mimeType, modifiedTime)',
@@ -276,9 +300,7 @@ class GoogleDriveSync:
                 file_path = os.path.join(prefix, file_name) if prefix else file_name
                 
                 if file['mimeType'] == 'application/vnd.google-apps.folder':
-                    # Recursively scan subfolder
-                    subfolder_files = self._scan_drive_files(file['id'], file_path)
-                    drive_files.update(subfolder_files)
+                    subfolders.append((file['id'], file_path))
                 else:
                     drive_files[file_path] = {
                         'id': file['id'],
@@ -290,79 +312,104 @@ class GoogleDriveSync:
             if not page_token:
                 break
         
+        # Scan subfolders in parallel
+        if subfolders:
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = {
+                    executor.submit(self._scan_drive_files, fid, fpath): fpath
+                    for fid, fpath in subfolders
+                }
+                for future in as_completed(futures):
+                    try:
+                        subfolder_files = future.result()
+                        drive_files.update(subfolder_files)
+                    except Exception as e:
+                        print(f"❌ Error scanning subfolder {futures[future]}: {e}")
+        
         return drive_files
     
     def sync_up(self):
-        """Upload local changes to Google Drive."""
+        """Upload local changes to Google Drive (parallel uploads)."""
         print("\n🔼 Checking for local changes to upload...")
         local_files = self._scan_local_files()
-        uploaded = 0
         
+        # Determine which files need uploading
+        files_to_upload = []
         for rel_path in local_files:
             full_path = os.path.join(LOCAL_FOLDER, rel_path)
             mtime = os.path.getmtime(full_path)
             
-            # Check if file needs upload
             if rel_path not in self.metadata['files']:
-                # New file
-                self._upload_file(full_path)
-                uploaded += 1
+                files_to_upload.append(full_path)
             else:
-                # Check if modified
                 stored_mtime = self.metadata['files'][rel_path].get('mtime', 0)
                 if mtime > stored_mtime:
-                    self._upload_file(full_path)
-                    uploaded += 1
+                    files_to_upload.append(full_path)
         
-        if uploaded > 0:
-            print(f"✅ Uploaded {uploaded} file(s)")
-        else:
+        if not files_to_upload:
             print("✅ No local changes to upload")
+            return
+        
+        # Upload files in parallel
+        uploaded = 0
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(self._upload_file, fp): fp for fp in files_to_upload}
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                    uploaded += 1
+                except Exception as e:
+                    print(f"❌ Error uploading {futures[future]}: {e}")
+        
+        print(f"✅ Uploaded {uploaded} file(s)")
     
     def sync_down(self):
-        """Download changes from Google Drive."""
+        """Download changes from Google Drive (parallel downloads)."""
         print("\n🔽 Checking for Drive changes to download...")
         drive_files = self._scan_drive_files()
-        downloaded = 0
         
+        # Determine which files need downloading
+        files_to_download = []  # List of (file_id, file_name, local_path, drive_mtime)
         for rel_path, file_info in drive_files.items():
             local_path = os.path.join(LOCAL_FOLDER, rel_path)
             
-            # Check if file needs download
             if not os.path.exists(local_path):
-                # New file from Drive
-                self._download_file(
-                    file_info['id'],
-                    file_info['name'],
-                    local_path,
-                    file_info['mtime']
-                )
-                downloaded += 1
+                files_to_download.append((
+                    file_info['id'], file_info['name'], local_path, file_info['mtime']
+                ))
             else:
-                # Check if Drive version is newer
                 if rel_path in self.metadata['files']:
                     stored_drive_mtime = self.metadata['files'][rel_path].get('drive_mtime')
                     if file_info['mtime'] != stored_drive_mtime:
-                        # Drive file was modified
                         local_mtime = os.path.getmtime(local_path)
                         stored_local_mtime = self.metadata['files'][rel_path].get('mtime', 0)
                         
-                        # Only download if local file hasn't changed
                         if local_mtime == stored_local_mtime:
-                            self._download_file(
-                                file_info['id'],
-                                file_info['name'],
-                                local_path,
-                                file_info['mtime']
-                            )
-                            downloaded += 1
+                            files_to_download.append((
+                                file_info['id'], file_info['name'], local_path, file_info['mtime']
+                            ))
                         else:
                             print(f"⚠️  Conflict detected: {rel_path} (keeping local version)")
         
-        if downloaded > 0:
-            print(f"✅ Downloaded {downloaded} file(s)")
-        else:
+        if not files_to_download:
             print("✅ No Drive changes to download")
+            return
+        
+        # Download files in parallel
+        downloaded = 0
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(self._download_file, fid, fname, lpath, dmtime): fname
+                for fid, fname, lpath, dmtime in files_to_download
+            }
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                    downloaded += 1
+                except Exception as e:
+                    print(f"❌ Error downloading {futures[future]}: {e}")
+        
+        print(f"✅ Downloaded {downloaded} file(s)")
     
     def sync(self):
         """Perform a full bidirectional sync."""
