@@ -37,7 +37,7 @@ def main():
         print(f"\n❌ Error: {e}")
         print("\nPlease ensure:")
         print("1. OAuth credentials file exists in secrets/ folder")
-        print("2. The file name matches the CREDS_FILE in google_drive_sync.py")
+        print("2. The file name matches the CREDS_FILE in config.py")
         return 1
     except KeyboardInterrupt:
         print("\n\n👋 Goodbye!")

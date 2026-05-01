@@ -8,9 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
-secrets/
+secrets/*
+!secrets/.gitkeep
 
 # Sync files (sensitive)
-token.pickle
 sync_metadata.json
 .env
