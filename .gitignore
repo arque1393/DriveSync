@@ -13,4 +13,5 @@ secrets/*
 
 # Sync files (sensitive)
 sync_metadata.json
+user_config.json
 .env
