@@ -5,6 +5,7 @@ list, then appends them to missed_sync.log and prints a console summary.
 """
 
 import threading
+from collections import Counter
 from datetime import datetime
 from typing import List, Tuple
 
@@ -61,22 +62,16 @@ class MissedLog:
         if not self._entries:
             return
 
-        counts = {UP: 0, DOWN: 0, SCAN: 0, CONFLICT: 0}
-        for direction, _, _ in self._entries:
-            if direction in counts:
-                counts[direction] += 1
+        counts = Counter(d for d, _, _ in self._entries)
+        labels = [(UP, 'upload'), (DOWN, 'download'), (SCAN, 'scan failure'), (CONFLICT, 'conflict')]
+        parts  = [
+            f"{n} {word}{'s' if n != 1 else ''}"
+            for key, word in labels
+            if (n := counts[key])
+        ]
 
-        parts = []
-        if counts[UP]:        parts.append(f"{counts[UP]} upload{'s' if counts[UP] != 1 else ''}")
-        if counts[DOWN]:      parts.append(f"{counts[DOWN]} download{'s' if counts[DOWN] != 1 else ''}")
-        if counts[SCAN]:      parts.append(f"{counts[SCAN]} scan failure{'s' if counts[SCAN] != 1 else ''}")
-        if counts[CONFLICT]:  parts.append(f"{counts[CONFLICT]} conflict{'s' if counts[CONFLICT] != 1 else ''}")
-
-        print(f'\n⚠️  {self.count} file(s) not synced '
-              f'({", ".join(parts)}) — see {LOG_FILE}')
-
-        preview = self._entries[:6]
-        for direction, path, _ in preview:
+        print(f'\n⚠️  {self.count} file(s) not synced ({", ".join(parts)}) — see {LOG_FILE}')
+        for direction, path, _ in self._entries[:6]:
             print(f'   [{direction}]  {path}')
         if self.count > 6:
             print(f'   … and {self.count - 6} more')

@@ -6,6 +6,7 @@ USER_CONFIG_FILE = 'user_config.json'
 SCOPES               = ['https://www.googleapis.com/auth/drive']
 SERVICE_ACCOUNT_FILE = 'secrets/mydesktopsync-ecd639c07433.json'
 METADATA_FILE        = 'sync_metadata.json'
+LOG_FILE             = 'missed_sync.log'
 
 # ── Defaults (overridden by user_config.json when present) ───────────────────
 _DEFAULTS = {
