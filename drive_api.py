@@ -28,6 +28,7 @@ Usage
 import asyncio
 import json
 import os
+import uuid
 from typing import Any, Dict, List, Optional
 
 import aiofiles
@@ -196,25 +197,45 @@ class DriveSession:
         async with aiofiles.open(local_path, 'rb') as fh:
             content = await fh.read()
 
-        # multipart/related — Drive requires this exact subtype
-        mp = aiohttp.MultipartWriter('related')
-        mp.append_json(metadata)
-        mp.append(content, {'Content-Type': 'application/octet-stream'})
+        # Build the multipart/related body manually.
+        # aiohttp.MultipartWriter adds 'Content-Disposition: form-data' to each
+        # part — that is multipart/form-data spec and causes Drive to return 403.
+        # Drive's multipart/related endpoint only accepts Content-Type per part.
+        boundary    = uuid.uuid4().hex
+        meta_bytes  = json.dumps(metadata).encode('utf-8')
+        body: bytes = (
+            f'--{boundary}\r\n'
+            f'Content-Type: application/json; charset=UTF-8\r\n\r\n'
+        ).encode() + meta_bytes + (
+            f'\r\n--{boundary}\r\n'
+            f'Content-Type: application/octet-stream\r\n\r\n'
+        ).encode() + content + (
+            f'\r\n--{boundary}--\r\n'
+        ).encode()
 
+        headers = {
+            **await self._headers(),
+            'Content-Type': f'multipart/related; boundary={boundary}',
+        }
         params = {**_ITEM_PARAMS, 'uploadType': 'multipart', 'fields': 'id,modifiedTime'}
 
         if existing_id:
             ctx = self._session.patch(
                 f'{_UPLOAD_BASE}/files/{existing_id}',
-                headers=await self._headers(), params=params, data=mp,
+                headers=headers, params=params, data=body,
             )
         else:
             ctx = self._session.post(
                 f'{_UPLOAD_BASE}/files',
-                headers=await self._headers(), params=params, data=mp,
+                headers=headers, params=params, data=body,
             )
         async with ctx as resp:
-            resp.raise_for_status()
+            if not resp.ok:
+                err = await resp.text()
+                raise aiohttp.ClientResponseError(
+                    resp.request_info, resp.history,
+                    status=resp.status, message=err,
+                )
             return await resp.json()
 
     async def _upload_resumable(
@@ -243,7 +264,12 @@ class DriveSession:
 
         async with method(url, headers=init_headers, params=params,
                           data=json.dumps(metadata)) as resp:
-            resp.raise_for_status()
+            if not resp.ok:
+                err = await resp.text()
+                raise aiohttp.ClientResponseError(
+                    resp.request_info, resp.history,
+                    status=resp.status, message=err,
+                )
             session_url = resp.headers['Location']
 
         # ── Step 2: stream file in chunks ─────────────────────────────────────

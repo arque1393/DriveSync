@@ -2,6 +2,7 @@
 """Google Drive Sync — bidirectional sync between a local folder and Google Drive."""
 
 import argparse
+import os
 import sys
 
 
@@ -25,17 +26,11 @@ def dim(t):    return _fmt(t, '2')
 
 def print_help() -> None:
     from config import (
-        SERVICE_ACCOUNT_FILE, SYNC_INTERVAL,
+        CREDS_FILE, TOKEN_FILE, SYNC_INTERVAL,
         LOCAL_FOLDER, DRIVE_FOLDER_NAME, DRIVE_FOLDER_ID, MAX_WORKERS,
     )
 
-    sa_email = '(key file not found)'
-    try:
-        import json
-        with open(SERVICE_ACCOUNT_FILE) as f:
-            sa_email = json.load(f).get('client_email', sa_email)
-    except (FileNotFoundError, KeyError, json.JSONDecodeError):
-        pass
+    token_status = '✅ saved' if os.path.exists(TOKEN_FILE) else '⚠️  not yet — browser needed on first run'
 
     rule = blue('─' * 62)
 
@@ -70,12 +65,11 @@ def print_help() -> None:
   Sync interval  {green(str(SYNC_INTERVAL) + ' s')}
   Max workers    {green(str(MAX_WORKERS))}
 
-{bold('AUTH')}  {dim('· service account — no browser login required ·')}
-  Key file       {dim(SERVICE_ACCOUNT_FILE)}
-  Share target   {dim(sa_email)}
-  {dim('Steps: share your Drive folder with the address above (Editor role),')}
-  {dim('then paste the folder ID from the Drive URL into --setup.')}
-  {dim('Folder ID is in: drive.google.com/drive/folders/<ID HERE>')}
+{bold('AUTH')}  {dim('· OAuth user credentials ·')}
+  Credentials    {dim(CREDS_FILE)}
+  Token          {dim(TOKEN_FILE)}  {dim(token_status)}
+  {dim('First run opens a browser once. Token is saved and auto-refreshed')}
+  {dim('on every subsequent run — no browser needed after that.')}
 
 {bold('EXAMPLES')}
   {dim('python main.py --dry-run')}             Preview pending changes (safe, read-only)

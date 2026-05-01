@@ -3,10 +3,18 @@ import os
 
 USER_CONFIG_FILE = 'user_config.json'
 
-SCOPES               = ['https://www.googleapis.com/auth/drive']
+SCOPES     = ['https://www.googleapis.com/auth/drive']
+CREDS_FILE = (
+    'secrets/client_secret_116989766183-v0e50u650rdhah0j933fsloke77hp1od'
+    '.apps.googleusercontent.com.json'
+)
+TOKEN_FILE    = 'secrets/token.pickle'   # saved after first browser login
+METADATA_FILE = 'sync_metadata.json'
+LOG_FILE      = 'missed_sync.log'
+
+# Kept for reference — service accounts cannot create files on personal Drive.
+# They have zero storage quota and will get 403 storageQuotaExceeded on POST.
 SERVICE_ACCOUNT_FILE = 'secrets/mydesktopsync-ecd639c07433.json'
-METADATA_FILE        = 'sync_metadata.json'
-LOG_FILE             = 'missed_sync.log'
 
 # ── Defaults (overridden by user_config.json when present) ───────────────────
 _DEFAULTS = {
