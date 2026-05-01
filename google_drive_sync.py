@@ -202,6 +202,127 @@ class GoogleDriveSync:
 
         return {'scan': t_scan, 'download': t_download}
 
+    # ── dry-run preview ───────────────────────────────────────────────────────
+
+    async def _preview_cycle(self) -> None:
+        """
+        Scan both sides and show every pending change — nothing is transferred.
+
+        Runs the same scan + decision logic as a real sync cycle but stops
+        before any upload or download call.  Both scans run concurrently so
+        the preview is as fast as the drive-scan alone (~6–10 s).
+
+        Output legend
+        ─────────────
+          ↑  [new]       local file not yet on Drive
+          ↑  [modified]  local file newer than last synced version
+          ↓  [new]       Drive file not yet on local disk
+          ↓  [updated]   Drive file changed since last sync, local unchanged
+          ⚡  [conflict]  both sides changed — real sync would keep local
+        """
+        ts = datetime.now()
+        rule = '─' * 60
+        print(f"\n{'═'*60}")
+        print(f"🔍 Dry-run — pending changes only, nothing will be modified")
+        print(f"   Scanned at {ts.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'═'*60}")
+
+        drive_ops.clear_folder_cache()
+
+        try:
+            async with DriveSession(self.creds) as ds:
+                root_id = await drive_ops.get_or_create_root_folder(
+                    ds, DRIVE_FOLDER_NAME, folder_id=DRIVE_FOLDER_ID or None
+                )
+
+                # Both scans run concurrently — same pattern as the real cycle
+                t0 = time.perf_counter()
+                local_files, drive_files = await asyncio.gather(
+                    asyncio.to_thread(scan_local_files, LOCAL_FOLDER),
+                    drive_ops.scan_drive_files(ds, root_id, concurrency=SCAN_CONCURRENCY),
+                )
+                t_scan = time.perf_counter() - t0
+                print(f"\n   📂 Local:  {len(local_files)} files  │  "
+                      f"☁  Drive: {len(drive_files)} files  │  "
+                      f"scanned in {_fmt(t_scan)}")
+
+                # ── Classify uploads ──────────────────────────────────────────
+                to_upload_new:  list = []   # not in metadata → brand new
+                to_upload_mod:  list = []   # in metadata but mtime advanced
+
+                for rel in sorted(local_files):
+                    full  = str(Path(LOCAL_FOLDER) / rel)
+                    mtime = os.path.getmtime(full)
+                    stored = self.metadata['files'].get(rel)
+                    if stored is None:
+                        to_upload_new.append(rel)
+                    elif mtime > stored.get('mtime', 0):
+                        to_upload_mod.append(rel)
+
+                # ── Classify downloads + conflicts ────────────────────────────
+                to_dl_new:   list = []   # not on local disk
+                to_dl_upd:   list = []   # Drive changed, local unchanged
+                conflicts:   list = []   # both sides changed
+
+                for rel, info in sorted(drive_files.items()):
+                    local_path = str(Path(LOCAL_FOLDER) / rel)
+                    stored     = self.metadata['files'].get(rel)
+
+                    if not os.path.exists(local_path):
+                        to_dl_new.append(rel)
+                    elif stored is None:
+                        pass   # local exists, untracked → sync_up will handle it
+                    elif info['mtime'] != stored.get('drive_mtime'):
+                        if os.path.getmtime(local_path) == stored.get('mtime', 0):
+                            to_dl_upd.append(rel)
+                        else:
+                            conflicts.append(rel)
+
+        except Exception as e:
+            print(f"\n❌ Preview failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return
+
+        # ── Print results ─────────────────────────────────────────────────────
+        def _section(title: str, items: list, icon: str, label: str) -> None:
+            if not items:
+                return
+            print(f"\n{rule}")
+            print(f"  {title}")
+            print(rule)
+            for item in items:
+                print(f"   {icon}  {item}  [{label}]")
+
+        _section("Would upload  (Local → Drive)", to_upload_new, "↑", "new")
+        _section("Would upload  (Local → Drive)", to_upload_mod, "↑", "modified")
+        _section("Would download  (Drive → Local)", to_dl_new,  "↓", "new on Drive")
+        _section("Would download  (Drive → Local)", to_dl_upd,  "↓", "Drive updated")
+
+        if conflicts:
+            print(f"\n{rule}")
+            print(f"  Conflicts  (both sides changed — real sync keeps local)")
+            print(rule)
+            for c in conflicts:
+                print(f"   ⚡  {c}")
+
+        # ── Summary ───────────────────────────────────────────────────────────
+        n_up   = len(to_upload_new) + len(to_upload_mod)
+        n_down = len(to_dl_new)     + len(to_dl_upd)
+        n_conf = len(conflicts)
+
+        print(f"\n{'═'*60}")
+        if n_up == 0 and n_down == 0 and n_conf == 0:
+            print("  ✅ Everything is in sync — nothing to do.")
+        else:
+            parts = []
+            if n_up:    parts.append(f"↑ {n_up} to upload")
+            if n_down:  parts.append(f"↓ {n_down} to download")
+            if n_conf:  parts.append(f"⚡ {n_conf} conflict{'s' if n_conf != 1 else ''}")
+            print(f"  📊  {'  │  '.join(parts)}")
+        print(f"  ⏱   scanned in {_fmt(t_scan)}")
+        print(f"{'═'*60}\n")
+
     # ── core async sync cycle ─────────────────────────────────────────────────
 
     async def _run_cycle(self) -> None:
@@ -246,6 +367,10 @@ class GoogleDriveSync:
             traceback.print_exc()
 
     # ── Public API ────────────────────────────────────────────────────────────
+
+    def preview(self) -> None:
+        """Show pending changes without transferring anything (--dry-run)."""
+        asyncio.run(self._preview_cycle())
 
     def sync(self) -> None:
         """Run one sync cycle and return (used by --sync-once)."""

@@ -54,6 +54,7 @@ def print_help() -> None:
 {bold('FLAGS')}
   {cyan('--run')}          Start the continuous sync loop  {dim('(Ctrl+C to stop)')}
   {cyan('--sync-once')}    Run a single sync cycle and exit
+  {cyan('--dry-run')}      Scan both sides and show what would change — nothing transferred
   {cyan('--setup')}        Open the GUI to configure folders
                  {dim('Combine with --run or --sync-once to sync after setup')}
   {cyan('-h, --help')}     Show this help message
@@ -77,6 +78,7 @@ def print_help() -> None:
   {dim('Folder ID is in: drive.google.com/drive/folders/<ID HERE>')}
 
 {bold('EXAMPLES')}
+  {dim('python main.py --dry-run')}             Preview pending changes (safe, read-only)
   {dim('python main.py --run')}                 Start continuous sync
   {dim('python main.py --sync-once')}           Sync once and exit
   {dim('python main.py --setup')}               Configure folders only
@@ -95,13 +97,14 @@ def main() -> int:
     parser.add_argument('--setup',          action='store_true')
     parser.add_argument('--run',            action='store_true')
     parser.add_argument('--sync-once',      action='store_true', dest='sync_once')
+    parser.add_argument('--dry-run',        action='store_true', dest='dry_run')
     parser.add_argument('--interval',       type=int, default=None,
                         metavar='N',
                         help='Sync interval in seconds (overrides saved config)')
 
     args = parser.parse_args()
 
-    no_action = not any([args.setup, args.run, args.sync_once])
+    no_action = not any([args.setup, args.run, args.sync_once, args.dry_run])
 
     if args.help or no_action:
         print_help()
@@ -127,7 +130,9 @@ def main() -> int:
     try:
         sync = GoogleDriveSync(sync_interval=interval)
 
-        if args.sync_once:
+        if args.dry_run:
+            sync.preview()
+        elif args.sync_once:
             print('🔄 Running single sync...')
             sync.sync()
             print('\n✅ Single sync completed!')
