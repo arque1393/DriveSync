@@ -365,7 +365,9 @@ class GoogleDriveSync:
     
     def sync_down(self):
         """Download changes from Google Drive (parallel downloads)."""
+        import time
         print("\n🔽 Checking for Drive changes to download...")
+        _in = time.now
         drive_files = self._scan_drive_files()
         
         # Determine which files need downloading
