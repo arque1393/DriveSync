@@ -1,36 +1,27 @@
 import os
-import pickle
+import ssl
 
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
+from google.oauth2 import service_account
 
-from config import CREDS_FILE, TOKEN_FILE, SCOPES
+from config import SERVICE_ACCOUNT_FILE, SCOPES
+
+# On corporate networks (e.g. Zscaler), the proxy re-signs TLS traffic with its
+# own CA. truststore makes Python use the OS certificate store (Windows/macOS/Linux)
+# which already has the corporate CA installed by IT — so connections succeed.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    pass  # not installed; default SSL behaviour
 
 
 def get_credentials():
-    """Get or refresh OAuth credentials."""
-    creds = None
-
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, 'rb') as token:
-            creds = pickle.load(token)
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            print("🔄 Refreshing authentication token...")
-            creds.refresh(Request())
-        else:
-            if not os.path.exists(CREDS_FILE):
-                raise FileNotFoundError(
-                    f"Credentials file not found: {CREDS_FILE}\n"
-                    "Please ensure the OAuth client secret file is in the secrets/ folder."
-                )
-            print("🔐 Starting authentication flow...")
-            flow = InstalledAppFlow.from_client_secrets_file(CREDS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-
-        with open(TOKEN_FILE, 'wb') as token:
-            pickle.dump(creds, token)
-        print("✅ Authentication successful!")
-
-    return creds
+    """Return service-account credentials — no browser, no token file."""
+    if not os.path.exists(SERVICE_ACCOUNT_FILE):
+        raise FileNotFoundError(
+            f"Service account key not found: {SERVICE_ACCOUNT_FILE}\n"
+            "Ensure the JSON key file is present in the secrets/ folder."
+        )
+    return service_account.Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_FILE, scopes=SCOPES
+    )
