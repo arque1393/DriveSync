@@ -10,13 +10,20 @@ LOG_FILE             = 'missed_sync.log'
 
 # ── Defaults (overridden by user_config.json when present) ───────────────────
 _DEFAULTS = {
-    'local_folder':      '/home/aritrarc1/GDrive',
-    'drive_folder_name': 'Obsidian',
-    'drive_folder_id':   '',
-    'sync_interval':     300,
-    'scan_workers':      10,   # parallel threads for folder scanning (lightweight)
-    'download_workers':  3,    # parallel threads for file downloads (heavy — keep low)
-    'download_retries':  4,    # how many times to retry a failed download
+    'local_folder':       '/home/aritrarc1/GDrive',
+    'drive_folder_name':  'Obsidian',
+    'drive_folder_id':    '',
+    'sync_interval':      300,
+    # ── Thread-pool knobs (legacy sync path) ────────────────────────────────
+    'scan_workers':       10,
+    'download_workers':   3,
+    'download_retries':   4,
+    # ── Async concurrency knobs (asyncio path) ───────────────────────────────
+    # These cap how many coroutines can be awaiting a network call at once.
+    # Raising them speeds up large vaults; lower them on unstable connections.
+    'scan_concurrency':   30,   # concurrent folder-listing requests
+    'upload_concurrency': 5,    # concurrent file uploads
+    'download_concurrency': 5,  # concurrent file downloads
 }
 
 
@@ -38,7 +45,10 @@ DRIVE_FOLDER_ID   = _user.get('drive_folder_id',   _DEFAULTS['drive_folder_id'])
 SYNC_INTERVAL     = _user.get('sync_interval',     _DEFAULTS['sync_interval'])
 SCAN_WORKERS      = _user.get('scan_workers',      _DEFAULTS['scan_workers'])
 DOWNLOAD_WORKERS  = _user.get('download_workers',  _DEFAULTS['download_workers'])
-DOWNLOAD_RETRIES  = _user.get('download_retries',  _DEFAULTS['download_retries'])
+DOWNLOAD_RETRIES      = _user.get('download_retries',      _DEFAULTS['download_retries'])
+SCAN_CONCURRENCY      = _user.get('scan_concurrency',      _DEFAULTS['scan_concurrency'])
+UPLOAD_CONCURRENCY    = _user.get('upload_concurrency',    _DEFAULTS['upload_concurrency'])
+DOWNLOAD_CONCURRENCY  = _user.get('download_concurrency',  _DEFAULTS['download_concurrency'])
 
-# Legacy alias — scan operations still use this
+# Legacy alias — sync path thread workers
 MAX_WORKERS = SCAN_WORKERS
