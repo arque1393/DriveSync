@@ -31,6 +31,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 import aiofiles
+import aiofiles.os
 import aiohttp
 from google.auth.transport.requests import Request
 
@@ -149,7 +150,7 @@ class DriveSession:
 
     async def download(self, file_id: str, local_path: str) -> None:
         """Stream a Drive file to disk in 10 MB chunks — O(1) memory usage."""
-        os.makedirs(os.path.dirname(local_path) or '.', exist_ok=True)
+        await aiofiles.os.makedirs(os.path.dirname(local_path) or '.', exist_ok=True)
         async with self._session.get(
             f'{_DRIVE_BASE}/files/{file_id}',
             headers=await self._headers(),
@@ -176,7 +177,7 @@ class DriveSession:
           < 5 MB  →  multipart upload    (single request, no session setup)
           ≥ 5 MB  →  resumable upload    (chunked, recoverable on network error)
         """
-        size = os.path.getsize(local_path)
+        size = (await aiofiles.os.stat(local_path)).st_size
         if size < _SMALL_FILE:
             return await self._upload_multipart(local_path, file_name, parent_id, existing_id)
         return await self._upload_resumable(local_path, file_name, parent_id, existing_id, size)

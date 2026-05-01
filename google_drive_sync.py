@@ -69,6 +69,81 @@ def _fmt(seconds: float) -> str:
     return f"{m}m {s}s"
 
 
+# ── Sync decision helpers (run in a thread — batches all stat() calls) ────────
+# Calling asyncio.to_thread() once for the whole loop is far cheaper than
+# calling aiofiles.os.stat() 853 times individually (one thread dispatch each).
+
+def _find_uploads(local_files, metadata, local_folder):
+    """Return list of (full_path, rel_path) for files newer than stored mtime."""
+    result = []
+    for rel in local_files:
+        full  = str(Path(local_folder) / rel)
+        mtime = os.path.getmtime(full)
+        if mtime > metadata['files'].get(rel, {}).get('mtime', 0):
+            result.append((full, rel))
+    return result
+
+
+def _classify_preview(local_files, drive_files, metadata, local_folder):
+    """
+    Full classification for --dry-run.  All stat/exists calls batched here.
+    Returns (upload_new, upload_mod, dl_new, dl_updated, conflicts).
+    """
+    upload_new, upload_mod = [], []
+    for rel in sorted(local_files):
+        full   = str(Path(local_folder) / rel)
+        mtime  = os.path.getmtime(full)
+        stored = metadata['files'].get(rel)
+        if stored is None:
+            upload_new.append(rel)
+        elif mtime > stored.get('mtime', 0):
+            upload_mod.append(rel)
+
+    dl_new, dl_upd, conflicts = [], [], []
+    for rel, info in sorted(drive_files.items()):
+        local_path = str(Path(local_folder) / rel)
+        stored     = metadata['files'].get(rel)
+        if not os.path.exists(local_path):
+            dl_new.append(rel)
+        elif stored is None:
+            pass   # untracked local file — sync_up will upload it
+        elif info['mtime'] != stored.get('drive_mtime'):
+            if os.path.getmtime(local_path) == stored.get('mtime', 0):
+                dl_upd.append(rel)
+            else:
+                conflicts.append(rel)
+
+    return upload_new, upload_mod, dl_new, dl_upd, conflicts
+
+
+def _find_downloads(drive_files, metadata, local_folder):
+    """
+    Classify Drive files into three buckets.
+    Returns (to_download, conflicts, skip_msgs) — all sync filesystem ops batched.
+    """
+    to_download = []
+    conflicts   = []
+    skip_msgs   = []
+
+    for rel_path, info in drive_files.items():
+        local_path = str(Path(local_folder) / rel_path)
+        entry      = (info['id'], info['name'], local_path, info['mtime'])
+
+        if not os.path.exists(local_path):
+            to_download.append(entry)
+        elif rel_path in metadata['files']:
+            stored = metadata['files'][rel_path]
+            if info['mtime'] != stored.get('drive_mtime'):
+                if os.path.getmtime(local_path) == stored.get('mtime', 0):
+                    to_download.append(entry)
+                else:
+                    conflicts.append(rel_path)
+        else:
+            skip_msgs.append(rel_path)
+
+    return to_download, conflicts, skip_msgs
+
+
 class GoogleDriveSync:
     """Bidirectional Google Drive sync — fully async internals."""
 
@@ -95,12 +170,11 @@ class GoogleDriveSync:
         t_scan      = time.perf_counter() - t0
         print(f"   📂 Local scan:  {_fmt(t_scan)}  ({len(local_files)} files found)")
 
-        files_to_upload = [
-            (str(Path(LOCAL_FOLDER) / rel), rel)
-            for rel in local_files
-            if (os.path.getmtime(str(Path(LOCAL_FOLDER) / rel))
-                > self.metadata['files'].get(rel, {}).get('mtime', 0))
-        ]
+        # Batch all stat() calls into one thread — avoids 853 individual
+        # event-loop blockages from os.path.getmtime in a comprehension.
+        files_to_upload = await asyncio.to_thread(
+            _find_uploads, local_files, self.metadata, LOCAL_FOLDER
+        )
 
         if not files_to_upload:
             print("✅ No local changes to upload")
@@ -152,22 +226,14 @@ class GoogleDriveSync:
         t_scan = time.perf_counter() - t0
         print(f"   ☁  Drive scan:  {_fmt(t_scan)}  ({len(drive_files)} files indexed)")
 
-        files_to_download = []
-        for rel_path, info in drive_files.items():
-            local_path = str(Path(LOCAL_FOLDER) / rel_path)
-            entry      = (info['id'], info['name'], local_path, info['mtime'])
-
-            if not os.path.exists(local_path):
-                files_to_download.append(entry)
-            elif rel_path in self.metadata['files']:
-                stored = self.metadata['files'][rel_path]
-                if info['mtime'] != stored.get('drive_mtime'):
-                    if os.path.getmtime(local_path) == stored.get('mtime', 0):
-                        files_to_download.append(entry)
-                    else:
-                        print(f"⚠️  Conflict: {rel_path} (keeping local version)")
-            else:
-                print(f"ℹ️  Skipping {rel_path}: not in sync history (will upload)")
+        # Batch all exists()/getmtime() calls into one thread.
+        files_to_download, conflicts, skips = await asyncio.to_thread(
+            _find_downloads, drive_files, self.metadata, LOCAL_FOLDER
+        )
+        for rel_path in conflicts:
+            print(f"⚠️  Conflict: {rel_path} (keeping local version)")
+        for rel_path in skips:
+            print(f"ℹ️  Skipping {rel_path}: not in sync history (will upload)")
 
         if not files_to_download:
             print("✅ No Drive changes to download")
@@ -246,37 +312,12 @@ class GoogleDriveSync:
                       f"☁  Drive: {len(drive_files)} files  │  "
                       f"scanned in {_fmt(t_scan)}")
 
-                # ── Classify uploads ──────────────────────────────────────────
-                to_upload_new:  list = []   # not in metadata → brand new
-                to_upload_mod:  list = []   # in metadata but mtime advanced
-
-                for rel in sorted(local_files):
-                    full  = str(Path(LOCAL_FOLDER) / rel)
-                    mtime = os.path.getmtime(full)
-                    stored = self.metadata['files'].get(rel)
-                    if stored is None:
-                        to_upload_new.append(rel)
-                    elif mtime > stored.get('mtime', 0):
-                        to_upload_mod.append(rel)
-
-                # ── Classify downloads + conflicts ────────────────────────────
-                to_dl_new:   list = []   # not on local disk
-                to_dl_upd:   list = []   # Drive changed, local unchanged
-                conflicts:   list = []   # both sides changed
-
-                for rel, info in sorted(drive_files.items()):
-                    local_path = str(Path(LOCAL_FOLDER) / rel)
-                    stored     = self.metadata['files'].get(rel)
-
-                    if not os.path.exists(local_path):
-                        to_dl_new.append(rel)
-                    elif stored is None:
-                        pass   # local exists, untracked → sync_up will handle it
-                    elif info['mtime'] != stored.get('drive_mtime'):
-                        if os.path.getmtime(local_path) == stored.get('mtime', 0):
-                            to_dl_upd.append(rel)
-                        else:
-                            conflicts.append(rel)
+                # Batch all stat()/exists() calls into a single thread.
+                (to_upload_new, to_upload_mod,
+                 to_dl_new, to_dl_upd, conflicts) = await asyncio.to_thread(
+                    _classify_preview,
+                    local_files, drive_files, self.metadata, LOCAL_FOLDER,
+                )
 
         except Exception as e:
             print(f"\n❌ Preview failed: {e}")

@@ -33,6 +33,7 @@ import os
 import random
 from typing import Dict, List, Optional, Tuple
 
+import aiofiles.os
 from drive_api import DriveSession
 
 # ── Folder path cache (cleared every sync cycle) ─────────────────────────────
@@ -230,7 +231,7 @@ async def download_file(
                 await ds.download(file_id, local_path)
 
             print(f"📥 Downloaded: {rel_path}")
-            mtime = os.path.getmtime(local_path)
+            mtime = (await aiofiles.os.stat(local_path)).st_mtime
             async with metadata_lock:
                 metadata['files'][rel_path] = {
                     'mtime':      mtime,
@@ -267,7 +268,7 @@ async def upload_file(
 
     for attempt in range(max_retries + 1):
         try:
-            mtime  = os.path.getmtime(local_path)
+            mtime  = (await aiofiles.os.stat(local_path)).st_mtime
             resp   = await ds.list_files(
                 q=f"name='{file_name}' and '{parent_id}' in parents and trashed=false",
                 fields='files(id)',
