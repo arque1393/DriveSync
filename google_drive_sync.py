@@ -46,13 +46,16 @@ Expected improvement (853 files, ~80 folders)
 
 import asyncio
 import os
+import platform
+import shutil
+import socket
 import time
 from datetime import datetime
 from pathlib import Path
 
 from config import (
     LOCAL_FOLDER, DRIVE_FOLDER_NAME, DRIVE_FOLDER_ID,
-    SYNC_INTERVAL, DOWNLOAD_RETRIES,
+    DOWNLOAD_RETRIES,
     SCAN_CONCURRENCY, UPLOAD_CONCURRENCY, DOWNLOAD_CONCURRENCY,
 )
 from auth import get_credentials
@@ -69,17 +72,53 @@ def _fmt(seconds: float) -> str:
     return f"{m}m {s}s"
 
 
+# ── Device identification ─────────────────────────────────────────────────────
+
+def _get_device_name() -> str:
+    """Return a safe, filesystem-friendly hostname (≤ 24 chars, alphanumeric)."""
+    raw  = socket.gethostname() or platform.node() or 'local'
+    safe = ''.join(c for c in raw if c.isalnum() or c in '-_')
+    return (safe[:24] or 'local').upper()
+
+
+def _conflict_paths(rel_path: str, device_name: str):
+    """
+    Return (local_conflict_rel, drive_conflict_rel) for a conflicted file.
+
+    Examples
+    ────────
+    research.md          → research.local.HOSTNAME.md   /  research.drive.md
+    notes.excalidraw.md  → notes.excalidraw.local.HOSTNAME.md  /  notes.excalidraw.drive.md
+    image.png            → image.local.HOSTNAME.png     /  image.drive.png
+    """
+    p      = Path(rel_path)
+    stem   = p.stem        # everything before the last extension
+    ext    = p.suffix      # last extension only (e.g. '.md')
+    parent = p.parent
+
+    return (
+        str(parent / f'{stem}.local.{device_name}{ext}'),
+        str(parent / f'{stem}.drive{ext}'),
+    )
+
+
 # ── Sync decision helpers (run in a thread — batches all stat() calls) ────────
 # Calling asyncio.to_thread() once for the whole loop is far cheaper than
 # calling aiofiles.os.stat() 853 times individually (one thread dispatch each).
 
 def _find_uploads(local_files, metadata, local_folder):
-    """Return list of (full_path, rel_path) for files newer than stored mtime."""
+    """Return list of (full_path, rel_path) for files newer than stored mtime.
+
+    Ghost entries (mtime=None) are skipped — they represent conflict-resolved
+    paths where the local copy was renamed away; the original no longer exists.
+    """
     result = []
     for rel in local_files:
-        full  = str(Path(local_folder) / rel)
-        mtime = os.path.getmtime(full)
-        if mtime > metadata['files'].get(rel, {}).get('mtime', 0):
+        full         = str(Path(local_folder) / rel)
+        mtime        = os.path.getmtime(full)
+        # 'mtime or 0' converts None (ghost sentinel) to 0 without crashing
+        stored_mtime = metadata['files'].get(rel, {}).get('mtime') or 0
+        if mtime > stored_mtime:
             result.append((full, rel))
     return result
 
@@ -88,60 +127,169 @@ def _classify_preview(local_files, drive_files, metadata, local_folder):
     """
     Full classification for --dry-run.  All stat/exists calls batched here.
     Returns (upload_new, upload_mod, dl_new, dl_updated, conflicts).
+
+    conflicts entries are (rel, local_new_rel, drive_new_rel, kind) so the
+    preview screen can show the exact paths that would be created.
     """
+    device_name = _get_device_name()
+
     upload_new, upload_mod = [], []
     for rel in sorted(local_files):
-        full   = str(Path(local_folder) / rel)
-        mtime  = os.path.getmtime(full)
-        stored = metadata['files'].get(rel)
+        full         = str(Path(local_folder) / rel)
+        mtime        = os.path.getmtime(full)
+        stored       = metadata['files'].get(rel)
+        stored_mtime = (stored.get('mtime') or 0) if stored else 0
         if stored is None:
             upload_new.append(rel)
-        elif mtime > stored.get('mtime', 0):
+        elif mtime > stored_mtime:
             upload_mod.append(rel)
 
     dl_new, dl_upd, conflicts = [], [], []
     for rel, info in sorted(drive_files.items()):
         local_path = str(Path(local_folder) / rel)
         stored     = metadata['files'].get(rel)
-        if not os.path.exists(local_path):
-            dl_new.append(rel)
-        elif stored is None:
-            pass   # untracked local file — sync_up will upload it
-        elif info['mtime'] != stored.get('drive_mtime'):
-            if os.path.getmtime(local_path) == stored.get('mtime', 0):
-                dl_upd.append(rel)
+
+        if stored is not None:
+            if info['mtime'] == stored.get('drive_mtime'):
+                pass  # unchanged
+            elif stored.get('mtime') is None or not os.path.exists(local_path):
+                dl_new.append(rel)
             else:
-                conflicts.append(rel)
+                local_mtime = os.path.getmtime(local_path)
+                if local_mtime == (stored.get('mtime') or 0):
+                    dl_upd.append(rel)
+                else:
+                    local_new, drive_new = _conflict_paths(rel, device_name)
+                    conflicts.append((rel, local_new, drive_new, 'type1'))
+        elif not os.path.exists(local_path):
+            dl_new.append(rel)
+        else:
+            local_new, drive_new = _conflict_paths(rel, device_name)
+            conflicts.append((rel, local_new, drive_new, 'type2'))
 
     return upload_new, upload_mod, dl_new, dl_upd, conflicts
 
 
-def _find_downloads(drive_files, metadata, local_folder):
+def _find_downloads(drive_files, metadata, local_folder, device_name='local'):
     """
-    Classify Drive files into three buckets.
-    Returns (to_download, conflicts, skip_msgs) — all sync filesystem ops batched.
+    Classify every Drive file into one of four buckets.
+
+    Conflict types (HIGH risk) produce entries in `conflicts` instead of
+    being silently resolved in favour of local — both versions will be kept.
+
+    Returns
+    ───────
+    to_download : list of (drive_id, name, local_path, drive_mtime)
+    conflicts   : list of (original_rel, drive_id, name, drive_mtime,
+                           local_new_rel, drive_new_rel, kind)
+                  kind is 'type1' or 'type2'
+    msgs        : informational strings (empty now; kept for API compat)
     """
-    to_download = []
-    conflicts   = []
-    skip_msgs   = []
+    to_download: list = []
+    conflicts:   list = []
+    msgs:        list = []
 
-    for rel_path, info in drive_files.items():
-        local_path = str(Path(local_folder) / rel_path)
-        entry      = (info['id'], info['name'], local_path, info['mtime'])
+    for rel, info in drive_files.items():
+        local_path = str(Path(local_folder) / rel)
+        stored     = metadata['files'].get(rel)
 
-        if not os.path.exists(local_path):
-            to_download.append(entry)
-        elif rel_path in metadata['files']:
-            stored = metadata['files'][rel_path]
-            if info['mtime'] != stored.get('drive_mtime'):
-                if os.path.getmtime(local_path) == stored.get('mtime', 0):
-                    to_download.append(entry)
+        if stored is not None:
+            # ── Known file (was synced before, or is a ghost entry) ───────
+            ghost = stored.get('mtime') is None   # conflict-resolved sentinel
+
+            if info['mtime'] == stored.get('drive_mtime'):
+                # Drive unchanged since last sync → nothing to do
+                # (Respects intentional local deletions — no auto-restore)
+                pass
+
+            else:
+                # Drive has new content
+                if ghost:
+                    # Ghost: no local copy, Drive updated → re-download to original
+                    to_download.append((info['id'], info['name'], local_path, info['mtime']))
+
+                elif not os.path.exists(local_path):
+                    # Locally deleted AND Drive changed → restore Drive version
+                    to_download.append((info['id'], info['name'], local_path, info['mtime']))
+
                 else:
-                    conflicts.append(rel_path)
-        else:
-            skip_msgs.append(rel_path)
+                    local_mtime = os.path.getmtime(local_path)
+                    if local_mtime == (stored.get('mtime') or 0):
+                        # Drive changed, local unchanged → safe download
+                        to_download.append((info['id'], info['name'], local_path, info['mtime']))
+                    else:
+                        # ⚡ TYPE 1 — BOTH sides changed: keep both versions
+                        local_new, drive_new = _conflict_paths(rel, device_name)
+                        conflicts.append((rel, info['id'], info['name'],
+                                          info['mtime'], local_new, drive_new, 'type1'))
 
-    return to_download, conflicts, skip_msgs
+        elif not os.path.exists(local_path):
+            # ── Brand-new Drive file, not tracked, not local → download ───
+            to_download.append((info['id'], info['name'], local_path, info['mtime']))
+
+        else:
+            # ⚡ TYPE 2 — same path exists on BOTH sides, never synced: keep both
+            local_new, drive_new = _conflict_paths(rel, device_name)
+            conflicts.append((rel, info['id'], info['name'],
+                               info['mtime'], local_new, drive_new, 'type2'))
+
+    return to_download, conflicts, msgs
+
+
+def _resolve_conflicts(conflicts, metadata, local_folder):
+    """
+    Physically execute conflict resolution for each HIGH-RISK conflict:
+
+      1. Rename local copy  →  filename.local.DEVICE.ext
+      2. Insert a ghost metadata entry for the original path so the engine
+         does not re-download it on the next cycle.
+      3. Return download entries for the Drive copies (filename.drive.ext).
+         The normal download pipeline writes those files and records them in
+         metadata automatically.
+      4. The renamed local copy is intentionally left OUT of metadata so
+         sync_up will upload it to Drive on the very next cycle — ensuring
+         the user's work is never lost.
+
+    Ghost entry schema: {'mtime': None, 'drive_id': ..., 'drive_mtime': ...}
+      mtime=None means "we know Drive has this file, but we chose not to keep
+      a local copy at this path." The file is only re-downloaded if Drive
+      changes it again.
+    """
+    drive_downloads: list = []
+
+    for original_rel, drive_id, drive_name, drive_mtime, \
+            local_new_rel, drive_new_rel, kind in conflicts:
+
+        orig_path      = str(Path(local_folder) / original_rel)
+        local_new_path = str(Path(local_folder) / local_new_rel)
+        drive_new_path = str(Path(local_folder) / drive_new_rel)
+
+        # 1. Rename local copy.
+        #    On Windows a concurrent upload may hold the file open; fall back
+        #    to copy+delete so the conflict copy is always created.
+        if os.path.exists(orig_path):
+            os.makedirs(os.path.dirname(local_new_path) or '.', exist_ok=True)
+            try:
+                shutil.move(orig_path, local_new_path)
+            except (PermissionError, OSError):
+                shutil.copy2(orig_path, local_new_path)
+                try:
+                    os.unlink(orig_path)
+                except OSError:
+                    pass   # leave original in place; will be cleaned next cycle
+
+        # 2. Remove stale original metadata (if any) and insert ghost
+        metadata['files'].pop(original_rel, None)
+        metadata['files'][original_rel] = {
+            'mtime':      None,      # ghost sentinel — no local copy
+            'drive_id':   drive_id,
+            'drive_mtime': drive_mtime,
+        }
+
+        # 3. Queue Drive copy (downloaded by normal pipeline → auto-recorded)
+        drive_downloads.append((drive_id, drive_name, drive_new_path, drive_mtime))
+
+    return drive_downloads
 
 
 class GoogleDriveSync:
@@ -227,13 +375,23 @@ class GoogleDriveSync:
         print(f"   ☁  Drive scan:  {_fmt(t_scan)}  ({len(drive_files)} files indexed)")
 
         # Batch all exists()/getmtime() calls into one thread.
-        files_to_download, conflicts, skips = await asyncio.to_thread(
-            _find_downloads, drive_files, self.metadata, LOCAL_FOLDER
+        files_to_download, conflicts, _ = await asyncio.to_thread(
+            _find_downloads, drive_files, self.metadata, LOCAL_FOLDER,
+            _get_device_name(),
         )
-        for rel_path in conflicts:
-            print(f"⚠️  Conflict: {rel_path} (keeping local version)")
-        for rel_path in skips:
-            print(f"ℹ️  Skipping {rel_path}: not in sync history (will upload)")
+
+        # ── Resolve HIGH-RISK conflicts (keep both versions) ──────────────
+        if conflicts:
+            extra = await asyncio.to_thread(
+                _resolve_conflicts, conflicts, self.metadata, LOCAL_FOLDER
+            )
+            files_to_download.extend(extra)
+            print(f"\n⚡ {len(conflicts)} conflict(s) detected — keeping both versions:")
+            for orig, _, _, _, local_new, drive_new, kind in conflicts:
+                label = "both modified" if kind == 'type1' else "new file collision"
+                print(f"   [{label}]  {orig}")
+                print(f"      ├─ local → {local_new}")
+                print(f"      └─ drive → {drive_new}")
 
         if not files_to_download:
             print("✅ No Drive changes to download")
@@ -284,7 +442,9 @@ class GoogleDriveSync:
           ↑  [modified]  local file newer than last synced version
           ↓  [new]       Drive file not yet on local disk
           ↓  [updated]   Drive file changed since last sync, local unchanged
-          ⚡  [conflict]  both sides changed — real sync would keep local
+          ⚡  [conflict]  both sides changed — real sync keeps BOTH versions
+                          local → filename.local.DEVICE.ext
+                          drive → filename.drive.ext
         """
         ts = datetime.now()
         rule = '─' * 60
@@ -342,10 +502,13 @@ class GoogleDriveSync:
 
         if conflicts:
             print(f"\n{rule}")
-            print(f"  Conflicts  (both sides changed — real sync keeps local)")
+            print(f"  Conflicts  (both versions will be kept — HIGH RISK)")
             print(rule)
-            for c in conflicts:
-                print(f"   ⚡  {c}")
+            for orig, local_new, drive_new, kind in conflicts:
+                label = "both modified" if kind == 'type1' else "new file collision"
+                print(f"   ⚡  {orig}  [{label}]")
+                print(f"      ├─ local → {local_new}")
+                print(f"      └─ drive → {drive_new}")
 
         # ── Summary ───────────────────────────────────────────────────────────
         n_up   = len(to_upload_new) + len(to_upload_mod)

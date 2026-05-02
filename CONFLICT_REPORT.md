@@ -50,21 +50,38 @@ these **stored** values to classify each file.
 | Local mtime | **changed** since last sync |
 | Drive mtime | **changed** since last sync |
 
-**What happens in the code** (`_find_downloads`):
+**What happens in the code** (`_find_downloads` → `_resolve_conflicts`):
 ```python
-if os.path.getmtime(local_path) == stored.get('mtime', 0):
-    to_download.append(entry)   # only local changed → safe download
-else:
-    conflicts.append(rel_path)  # BOTH changed → conflict
+# Detection in _find_downloads:
+local_new, drive_new = _conflict_paths(rel, device_name)
+conflicts.append((rel, drive_id, name, drive_mtime, local_new, drive_new, 'type1'))
+
+# Resolution in _resolve_conflicts:
+shutil.move(original_path, local_new_path)          # rename local copy
+metadata['files'][original_rel] = {'mtime': None, ...}  # ghost entry
+drive_downloads.append((drive_id, name, drive_new_path, drive_mtime))  # queue Drive copy
 ```
 
-**Resolution:** Local version wins.  Drive version is silently discarded.  
-**Risk:** ⚠️ HIGH — Drive changes are permanently lost.  
-**Console output:** `⚠️  Conflict: path/to/file.md (keeping local version)`
+**Resolution:** **Both versions kept.**
+- Local copy renamed to `filename.local.HOSTNAME.ext`
+- Drive copy downloaded as `filename.drive.ext`
+- A **ghost entry** (`mtime: null`) is inserted for the original path so it
+  is not re-downloaded next cycle unless Drive changes it again.
+- The renamed local copy has **no metadata entry** → `sync_up` will upload
+  it to Drive on the very next cycle, ensuring the user's work is preserved.
+
+**Risk:** ✅ No data loss — both versions survive.  
+**Console output:**
+```
+⚡ 1 conflict(s) detected — keeping both versions:
+   [both modified]  Notes/research.md
+      ├─ local → Notes/research.local.DESKTOP-ABC123.md
+      └─ drive → Notes/research.drive.md
+```
 
 ---
 
-### Type 2 — New File Collision *(silent conflict)*
+### Type 2 — New File Collision *(previously silent)*
 
 | Attribute | State |
 |-----------|-------|
@@ -72,20 +89,28 @@ else:
 | Local file | Exists |
 | Drive file | Also exists at the same path |
 
-**What happens in the code** (`_find_downloads`, `_find_uploads`):
+**What happens in the code** (`_find_downloads` → `_resolve_conflicts`):
 ```python
-# _find_downloads — file exists locally but not in metadata:
-else:
-    skip_msgs.append(rel_path)   # skips download silently
+# Detection: file not in metadata, exists locally, Drive also has it
+local_new, drive_new = _conflict_paths(rel, device_name)
+conflicts.append((rel, drive_id, name, drive_mtime, local_new, drive_new, 'type2'))
 
-# _find_uploads — local file with no stored mtime means mtime > 0:
-if mtime > metadata['files'].get(rel, {}).get('mtime', 0):
-    result.append(...)           # uploads, overwrites Drive
+# Resolution: identical to Type 1
 ```
 
-**Resolution:** Local version is uploaded and overwrites the Drive version.  
-**Risk:** ⚠️ HIGH — Drive version is lost with no warning.  
-**Console output:** `ℹ️  Skipping path/to/file.md: not in sync history (will upload)`
+**Resolution:** **Both versions kept** — same mechanism as Type 1.
+- Local copy renamed to `filename.local.HOSTNAME.ext`
+- Drive copy downloaded as `filename.drive.ext`
+- Ghost entry inserted for original path.
+
+**Risk:** ✅ No data loss — previously Drive version was silently overwritten.  
+**Console output:**
+```
+⚡ 1 conflict(s) detected — keeping both versions:
+   [new file collision]  Notes/shared-note.md
+      ├─ local → Notes/shared-note.local.DESKTOP-ABC123.md
+      └─ drive → Notes/shared-note.drive.md
+```
 
 ---
 
@@ -93,19 +118,30 @@ if mtime > metadata['files'].get(rel, {}).get('mtime', 0):
 
 | Attribute | State |
 |-----------|-------|
-| File in metadata | Yes or No |
+| File in metadata | Yes |
 | Local file | **Deleted** |
-| Drive file | Still exists |
+| Drive file | Unchanged since last sync |
 
 **What happens in the code** (`_find_downloads`):
 ```python
-if not os.path.exists(local_path):
-    to_download.append(entry)   # always re-downloads — deletion is reversed
+# stored entry exists, Drive mtime == stored drive_mtime → Drive unchanged
+if info['mtime'] == stored.get('drive_mtime'):
+    pass   # respects the local deletion — file stays deleted
 ```
 
-**Resolution:** Drive version wins.  Deleted local file is **restored**.  
-**Risk:** 🔶 MEDIUM — intentional local deletions are silently undone every cycle.  
-**Console output:** `📥 Downloaded: path/to/file.md` (no warning that a deletion was reversed)
+When Drive **has changed** since last sync AND local was deleted:
+```python
+# Drive changed, local deleted → restore Drive version
+to_download.append((info['id'], info['name'], local_path, info['mtime']))
+```
+
+**Resolution:**
+- Drive **unchanged** → local deletion is **respected** (file stays gone).
+- Drive **changed** → Drive version is downloaded (user gets the update).
+
+**Risk:** 🟢 LOW — intentional deletions are now respected when Drive hasn't changed.
+*(Previously: always re-downloaded regardless.)*  
+**Console output:** `📥 Downloaded: path/to/file.md` (only when Drive also changed)
 
 ---
 
@@ -195,21 +231,36 @@ A rename looks like a **delete + create**.
 
 ## Resolution strategy (current)
 
-The engine uses a single strategy across all detected conflicts:
+| Scenario | Strategy | Data loss? |
+|----------|----------|------------|
+| **Both modified (Type 1)** | **Keep both** — `.local.DEVICE` + `.drive` | ✅ None |
+| **New file collision (Type 2)** | **Keep both** — `.local.DEVICE` + `.drive` | ✅ None |
+| Local deleted, Drive unchanged (Type 3) | Respect deletion | ✅ None |
+| Local deleted, Drive changed (Type 3b) | Download Drive version | ✅ None |
+| Drive deleted, local unchanged (Type 4) | Orphaned (local stays) | 🔵 Metadata drift |
+| Drive deleted, local modified (Type 5) | Local wins (re-uploads) | ✅ None |
+| Both deleted (Type 6) | Ghost entry cleaned up | ✅ None |
+| Rename on one side (Type 7) | Duplicate created | 🔶 Medium |
+
+### How "keep both" works
 
 ```
-LOCAL WINS — always.
+Conflict on: research.md
+                │
+                ├── shutil.move(research.md → research.local.DESKTOP-ABC123.md)
+                │       └── No metadata entry → sync_up uploads it next cycle
+                │
+                ├── download(Drive → research.drive.md)
+                │       └── metadata records it normally
+                │
+                └── ghost entry for research.md: {mtime: null, drive_mtime: <current>}
+                        └── prevents re-download unless Drive changes it again
 ```
 
-| Scenario | Winner |
-|----------|--------|
-| Both modified (Type 1) | Local |
-| New file collision (Type 2) | Local |
-| Local deleted, Drive exists (Type 3) | Drive ← (only exception) |
-| Drive deleted, local unchanged (Type 4) | Neither (orphaned) |
-| Drive deleted, local modified (Type 5) | Local |
-| Both deleted (Type 6) | Neither (correct) |
-| Rename on one side (Type 7) | Both (duplicate) |
+Ghost entry lifecycle:
+- Inserted when conflict is resolved
+- Suppresses re-download of the original path while Drive is unchanged
+- Removed and replaced by a real entry if Drive later updates the file
 
 ---
 
@@ -217,9 +268,9 @@ LOCAL WINS — always.
 
 | Risk | Type | Description | Data Loss? |
 |------|------|-------------|------------|
-| ⚠️ HIGH | 1 | Both sides modified | Drive version lost |
-| ⚠️ HIGH | 2 | New file collision (silent) | Drive version lost |
-| 🔶 MEDIUM | 3 | Local deletion reversed | Intentional delete undone |
+| ✅ RESOLVED | 1 | Both sides modified → **keep both** | None |
+| ✅ RESOLVED | 2 | New file collision → **keep both** | None |
+| 🟢 FIXED | 3 | Local deletion now **respected** when Drive unchanged | None |
 | 🔶 MEDIUM | 7 | Rename creates duplicate | Content duplicated |
 | 🔵 LOW | 4 | Drive deletion ignored | Metadata drift |
 | 🟢 LOW | 5 | Drive deleted, local modified | None |
