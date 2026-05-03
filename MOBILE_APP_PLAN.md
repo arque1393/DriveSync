@@ -176,35 +176,57 @@ DriveSync/
 
 ### 4.3 Conflict Resolver Screen  *(key feature)*
 
+> **How conflicts work now (updated from asyncio branch):**
+> The sync engine already keeps BOTH versions automatically:
+> - `research.local.HOSTNAME.md` ← your local changes
+> - `research.drive.md` ← Drive's changes
+> A ghost entry in metadata prevents re-download loops.
+> The resolver's job is to review those two files and pick a winner.
+
 ```
 ┌─────────────────────────────────────────────┐
 │  ← Conflict Resolver      2 of 5            │  ← counter
 ├─────────────────────────────────────────────┤
-│  ⚡ Notes/Research.md                       │  ← filename
-│  Both versions changed since last sync      │
+│  ⚡ Notes/Research.md                       │  ← original path
+│  Conflict resolved — review both copies     │
 ├─────────────────────────────────────────────┤
-│  [LOCAL]          [DRIVE]                   │  ← tab bar
+│  [LOCAL copy]     [DRIVE copy]              │  ← tab bar
 ├─────────────────────────────────────────────┤
-│                  ┆                          │
-│  Modified:       ┆  Modified:               │
-│  Today 14:22     ┆  Yesterday 09:15         │
-│  ─────────────   ┆  ─────────────           │
-│  # Research      ┆  # Research              │
-│  Notes 2026      ┆  Notes 2026              │
-│                  ┆                          │
-│  +Added quantum  ┆  +Added papers           │  ← diff highlights
-│   circuit notes  ┆   section                │  (green=add, red=del)
-│  -removed draft  ┆                          │
-│                  ┆                          │
-│  Size: 4.2 KB    ┆  Size: 3.8 KB            │
+│  research.local.DESKTOP-ABC123.md           │
+│  Modified: Today 14:22  ·  4.2 KB           │
+│  ─────────────────────────────────────────  │
+│  # Research Notes 2026                      │
+│  +Added quantum circuit notes               │  ← green = added
+│  -removed draft section                     │  ← red   = removed
+│                                             │
+│  ════ vs ════════════════════════════════   │
+│  research.drive.md                          │
+│  Modified: Yesterday 09:15  ·  3.8 KB       │
+│  ─────────────────────────────────────────  │
+│  # Research Notes 2026                      │
+│  +Added papers section                      │
+│                                             │
 └─────────────────────────────────────────────┤
-│  [✓ Keep Local] [↓ Take Drive] [⏭ Skip]    │
+│  [✓ Mine is final]  [↓ Theirs is final]    │
+│  [≡ Keep both]      [⏭ Decide later]       │
 └─────────────────────────────────────────────┘
-  ── Binary / Image files ──────────────────
-  (shows file metadata + thumbnails instead of diff)
+```
 
-  ── Bulk Actions (from list view) ──────────
-  [✓ Keep All Local]  [↓ Take All Drive]
+**Resolution actions:**
+
+| Button | What happens |
+|--------|-------------|
+| ✓ Mine is final | Delete `.drive` copy, rename `.local.DEVICE` → original, upload |
+| ↓ Theirs is final | Delete `.local.DEVICE` copy, rename `.drive` → original, update metadata |
+| ≡ Keep both | Remove ghost entry — both files stay as separate files |
+| ⏭ Decide later | Dismiss for now — ghost entry stays, both copies remain |
+
+```
+  ── Binary / Image files ──────────────────
+  (shows file metadata + size comparison, no diff)
+
+  ── Conflict list view ────────────────────
+  [✓ All mine]  [↓ All theirs]  [≡ Keep all]
 ```
 
 ---
@@ -353,6 +375,10 @@ WorkManager
 ---
 
 ## 7. Authentication on Mobile
+
+> **Updated:** Auth now uses OAuth user credentials (not service account).
+> Service accounts were tried but have zero Drive storage quota —
+> they can read but cannot create new files on personal Drive.
 
 ### Problem
 The current OAuth flow calls `flow.run_local_server()` which opens a browser.
