@@ -5,13 +5,13 @@ Thread vs Async decision
 ┌─────────────────────────┬────────────────────────────┬─────────────────────┐
 │ Operation               │ Approach                   │ Why                 │
 ├─────────────────────────┼────────────────────────────┼─────────────────────┤
-│ Drive folder scan       │ asyncio + Semaphore(30)     │ Pure HTTP I/O       │
-│ File download           │ asyncio + Semaphore(5)      │ Streaming I/O       │
-│ File upload             │ asyncio + Semaphore(5)      │ I/O bound           │
+│ Drive folder scan       │ asyncio + Semaphore(30)    │ Pure HTTP I/O       │
+│ File download           │ asyncio + Semaphore(5)     │ Streaming I/O       │
+│ File upload             │ asyncio + Semaphore(5)     │ I/O bound           │
 │ Folder path resolution  │ async + in-memory cache    │ HTTP I/O + caching  │
-│ Local file scan         │ asyncio.to_thread()         │ Sync disk lib       │
-│ Token refresh           │ asyncio.to_thread()         │ Sync google-auth    │
-│ Metadata save           │ asyncio.to_thread()         │ Sync disk write     │
+│ Local file scan         │ asyncio.to_thread()        │ Sync disk lib       │
+│ Token refresh           │ asyncio.to_thread()        │ Sync google-auth    │
+│ Metadata save           │ asyncio.to_thread()        │ Sync disk write     │
 └─────────────────────────┴────────────────────────────┴─────────────────────┘
 
 Concurrency model

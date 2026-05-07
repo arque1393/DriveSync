@@ -295,10 +295,15 @@ def _resolve_conflicts(conflicts, metadata, local_folder):
 class GoogleDriveSync:
     """Bidirectional Google Drive sync — fully async internals."""
 
-    def __init__(self, sync_interval: int = 300) -> None:
-        self.sync_interval = sync_interval
-        self.creds         = get_credentials()
-        self.metadata      = load_metadata()
+    def __init__(
+        self,
+        sync_interval:  int = 300,
+        conflict_keep: str | None = None,   # 'local' | 'drive' | None (keep both)
+    ) -> None:
+        self.sync_interval  = sync_interval
+        self.conflict_keep  = conflict_keep
+        self.creds          = get_credentials()
+        self.metadata       = load_metadata()
         os.makedirs(LOCAL_FOLDER, exist_ok=True)
 
     # ── sync_up ───────────────────────────────────────────────────────────────
@@ -380,18 +385,40 @@ class GoogleDriveSync:
             _get_device_name(),
         )
 
-        # ── Resolve HIGH-RISK conflicts (keep both versions) ──────────────
+        # ── Resolve conflicts using the configured policy ─────────────────
         if conflicts:
-            extra = await asyncio.to_thread(
-                _resolve_conflicts, conflicts, self.metadata, LOCAL_FOLDER
-            )
-            files_to_download.extend(extra)
-            print(f"\n⚡ {len(conflicts)} conflict(s) detected — keeping both versions:")
-            for orig, _, _, _, local_new, drive_new, kind in conflicts:
-                label = "both modified" if kind == 'type1' else "new file collision"
-                print(f"   [{label}]  {orig}")
-                print(f"      ├─ local → {local_new}")
-                print(f"      └─ drive → {drive_new}")
+            ck = self.conflict_keep
+            if ck == 'drive':
+                # Drive wins: download the Drive version directly to the
+                # original path, overwriting the local file.
+                print(f"\n⚡ {len(conflicts)} conflict(s) — Drive wins (--conflict-keep=drive):")
+                for orig, drive_id, drive_name, drive_mtime, _, _, kind in conflicts:
+                    local_path = str(Path(LOCAL_FOLDER) / orig)
+                    files_to_download.append((drive_id, drive_name, local_path, drive_mtime))
+                    label = "both modified" if kind == 'type1' else "new file collision"
+                    print(f"   [{label}]  {orig}  → overwriting local with Drive version")
+
+            elif ck == 'local':
+                # Local wins: skip the Drive download entirely.
+                # sync_up will upload the local version on this or the next cycle
+                # because local mtime > stored mtime (already in upload queue).
+                print(f"\n⚡ {len(conflicts)} conflict(s) — Local wins (--conflict-keep=local):")
+                for orig, _, _, _, _, _, kind in conflicts:
+                    label = "both modified" if kind == 'type1' else "new file collision"
+                    print(f"   [{label}]  {orig}  → keeping local, Drive will be overwritten on upload")
+
+            else:
+                # Default: keep both as .local.DEVICE and .drive copies
+                extra = await asyncio.to_thread(
+                    _resolve_conflicts, conflicts, self.metadata, LOCAL_FOLDER
+                )
+                files_to_download.extend(extra)
+                print(f"\n⚡ {len(conflicts)} conflict(s) detected — keeping both versions:")
+                for orig, _, _, _, local_new, drive_new, kind in conflicts:
+                    label = "both modified" if kind == 'type1' else "new file collision"
+                    print(f"   [{label}]  {orig}")
+                    print(f"      ├─ local → {local_new}")
+                    print(f"      └─ drive → {drive_new}")
 
         if not files_to_download:
             print("✅ No Drive changes to download")

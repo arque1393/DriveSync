@@ -55,8 +55,13 @@ def print_help() -> None:
   {cyan('-h, --help')}     Show this help message
 
 {bold('OPTIONS')}
-  {yellow('--interval N')}  Override the sync interval for this session {dim('(seconds)')}
-                 Saved default: {green(str(SYNC_INTERVAL) + ' s')}
+  {yellow('--interval N')}         Override the sync interval for this session {dim('(seconds)')}
+                         Saved default: {green(str(SYNC_INTERVAL) + ' s')}
+  {yellow('--conflict-keep')} {dim('local|drive')}
+                         Conflict resolution policy when both sides changed:
+                           {green('local')}  — local file wins, Drive version discarded
+                           {green('drive')}  — Drive file wins, local file overwritten
+                           {dim('(omit)')} — keep both as .local.DEVICE and .drive copies {dim('(default)')}
 
 {bold('CURRENT CONFIG')}  {dim('· change with --setup ·')}
   Local folder   {green(LOCAL_FOLDER)}
@@ -78,7 +83,9 @@ def print_help() -> None:
   {dim('python main.py --setup')}               Configure folders only
   {dim('python main.py --setup --run')}         Configure then start syncing
   {dim('python main.py --setup --sync-once')}   Configure then sync once
-  {dim('python main.py --run --interval 60')}   Sync every 60 seconds
+  {dim('python main.py --run --interval 60')}                  Sync every 60 seconds
+  {dim('python main.py --run --conflict-keep=drive')}         Drive always wins conflicts
+  {dim('python main.py --sync-once --conflict-keep=local')}   Local always wins conflicts
 {rule}
 """)
 
@@ -95,6 +102,9 @@ def main() -> int:
     parser.add_argument('--interval',       type=int, default=None,
                         metavar='N',
                         help='Sync interval in seconds (overrides saved config)')
+    parser.add_argument('--conflict-keep',  choices=['local', 'drive'], default=None,
+                        dest='conflict_keep', metavar='{local|drive}',
+                        help='Conflict policy: local=keep local, drive=take Drive version')
 
     args = parser.parse_args()
 
@@ -122,7 +132,7 @@ def main() -> int:
     interval = args.interval if args.interval is not None else SYNC_INTERVAL
 
     try:
-        sync = GoogleDriveSync(sync_interval=interval)
+        sync = GoogleDriveSync(sync_interval=interval, conflict_keep=args.conflict_keep)
 
         if args.dry_run:
             sync.preview()
