@@ -9,7 +9,6 @@ CREDS_FILE = (
     '.apps.googleusercontent.com.json'
 )
 TOKEN_FILE    = 'secrets/token.pickle'   # saved after first browser login
-METADATA_FILE = 'sync_metadata.json'
 LOG_FILE      = 'missed_sync.log'
 
 # Kept for reference — service accounts cannot create files on personal Drive.
@@ -48,6 +47,7 @@ def _load_user_config() -> dict:
 _user = _load_user_config()
 
 LOCAL_FOLDER      = _user.get('local_folder',      _DEFAULTS['local_folder'])
+METADATA_FILE     = os.path.join(LOCAL_FOLDER, 'sync_metadata.json')
 DRIVE_FOLDER_NAME = _user.get('drive_folder_name', _DEFAULTS['drive_folder_name'])
 DRIVE_FOLDER_ID   = _user.get('drive_folder_id',   _DEFAULTS['drive_folder_id'])
 SYNC_INTERVAL     = _user.get('sync_interval',     _DEFAULTS['sync_interval'])

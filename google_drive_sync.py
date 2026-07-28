@@ -55,7 +55,7 @@ from pathlib import Path
 
 from config import (
     LOCAL_FOLDER, DRIVE_FOLDER_NAME, DRIVE_FOLDER_ID,
-    DOWNLOAD_RETRIES,
+    METADATA_FILE, DOWNLOAD_RETRIES,
     SCAN_CONCURRENCY, UPLOAD_CONCURRENCY, DOWNLOAD_CONCURRENCY,
 )
 from auth import get_credentials
@@ -63,6 +63,9 @@ from metadata import load_metadata, save_metadata
 from local_ops import scan_local_files, get_drive_path
 from drive_api import DriveSession
 import drive_ops_async as drive_ops
+
+# Relative path of the metadata file within LOCAL_FOLDER (always at root level).
+_METADATA_NAME = 'sync_metadata.json'
 
 
 def _fmt(seconds: float) -> str:
@@ -114,6 +117,8 @@ def _find_uploads(local_files, metadata, local_folder):
     """
     result = []
     for rel in local_files:
+        if rel == _METADATA_NAME:
+            continue  # pushed to Drive separately after save_metadata
         full         = str(Path(local_folder) / rel)
         mtime        = os.path.getmtime(full)
         # 'mtime or 0' converts None (ghost sentinel) to 0 without crashing
@@ -135,6 +140,8 @@ def _classify_preview(local_files, drive_files, metadata, local_folder):
 
     upload_new, upload_mod = [], []
     for rel in sorted(local_files):
+        if rel == _METADATA_NAME:
+            continue  # pushed to Drive separately; hide from preview uploads
         full         = str(Path(local_folder) / rel)
         mtime        = os.path.getmtime(full)
         stored       = metadata['files'].get(rel)
@@ -148,6 +155,12 @@ def _classify_preview(local_files, drive_files, metadata, local_folder):
     for rel, info in sorted(drive_files.items()):
         local_path = str(Path(local_folder) / rel)
         stored     = metadata['files'].get(rel)
+
+        # Metadata file: Drive always wins — never shown as a conflict.
+        if rel == _METADATA_NAME:
+            if stored is None or info['mtime'] != stored.get('drive_mtime'):
+                dl_new.append(rel)
+            continue
 
         if stored is not None:
             if info['mtime'] == stored.get('drive_mtime'):
@@ -192,6 +205,13 @@ def _find_downloads(drive_files, metadata, local_folder, device_name='local'):
     for rel, info in drive_files.items():
         local_path = str(Path(local_folder) / rel)
         stored     = metadata['files'].get(rel)
+
+        # Metadata file: Drive always wins — download if Drive version differs,
+        # never create conflict copies regardless of local modifications.
+        if rel == _METADATA_NAME:
+            if stored is None or info['mtime'] != stored.get('drive_mtime'):
+                to_download.append((info['id'], info['name'], local_path, info['mtime']))
+            continue
 
         if stored is not None:
             # ── Known file (was synced before, or is a ghost entry) ───────
@@ -453,6 +473,65 @@ class GoogleDriveSync:
 
         return {'scan': t_scan, 'download': t_download}
 
+    # ── metadata pre-pull / post-push ────────────────────────────────────────
+
+    async def _pull_metadata_from_drive(
+        self, ds: DriveSession, root_id: str
+    ) -> dict | None:
+        """Download Drive's metadata file if it is newer than our local copy.
+
+        Returns the drive file record dict {mtime, drive_id, drive_mtime} so
+        the caller can stitch it into self.metadata after reloading from disk,
+        or None if Drive has no newer version.
+        """
+        stored            = self.metadata['files'].get(_METADATA_NAME)
+        stored_drive_mtime = stored.get('drive_mtime') if stored else None
+
+        resp = await ds.list_files(
+            q=(f"name='{_METADATA_NAME}' and '{root_id}' in parents"
+               " and trashed=false"),
+            fields='files(id,name,modifiedTime)',
+            page_size=1,
+        )
+        files = resp.get('files', [])
+        if not files:
+            return None  # metadata not yet on Drive
+
+        drive_file  = files[0]
+        drive_mtime = drive_file['modifiedTime']
+        if drive_mtime == stored_drive_mtime:
+            return None  # Drive unchanged since last push
+
+        local_path = Path(METADATA_FILE)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        await ds.download(drive_file['id'], local_path)
+        print("   📄 Pulled newer metadata from Drive — reloading state")
+        return {
+            'mtime':      local_path.stat().st_mtime,
+            'drive_id':   drive_file['id'],
+            'drive_mtime': drive_mtime,
+        }
+
+    async def _push_metadata_to_drive(
+        self,
+        ds: DriveSession,
+        root_id: str,
+        meta_lock: asyncio.Lock,
+    ) -> None:
+        """Upload the just-saved metadata file to Drive."""
+        meta_path = Path(METADATA_FILE)
+        if not meta_path.exists():
+            return
+        sem = asyncio.Semaphore(1)
+        try:
+            await drive_ops.upload_file(
+                ds, root_id, str(meta_path), _METADATA_NAME, [],
+                self.metadata, meta_lock, sem, DOWNLOAD_RETRIES,
+            )
+            print("   📄 Metadata pushed to Drive")
+        except Exception as e:
+            print(f"   ⚠️  Failed to push metadata to Drive: {e}")
+
     # ── dry-run preview ───────────────────────────────────────────────────────
 
     async def _preview_cycle(self) -> None:
@@ -574,6 +653,15 @@ class GoogleDriveSync:
                 root_id = await drive_ops.get_or_create_root_folder(
                     ds, DRIVE_FOLDER_NAME, folder_id=DRIVE_FOLDER_ID or None
                 )
+
+                # Pull Drive's metadata before syncing — if a newer copy exists
+                # (e.g. from another device) reload in-memory state so this
+                # cycle's decisions are based on the freshest known state.
+                drive_meta = await self._pull_metadata_from_drive(ds, root_id)
+                if drive_meta is not None:
+                    self.metadata = await asyncio.to_thread(load_metadata)
+                    self.metadata['files'][_METADATA_NAME] = drive_meta
+
                 # sync_up and sync_down share the same DriveSession and run
                 # concurrently — they operate on disjoint file sets so the
                 # only shared state (self.metadata) is guarded by meta_lock.
@@ -582,8 +670,11 @@ class GoogleDriveSync:
                     self.sync_down(ds, root_id, meta_lock),
                 )
 
-            # save_metadata is a sync atomic file-write — run in thread
-            await asyncio.to_thread(save_metadata, self.metadata)
+                # Persist then push — both inside the session so the upload
+                # can reuse the same aiohttp connection pool.
+                await asyncio.to_thread(save_metadata, self.metadata)
+                await self._push_metadata_to_drive(ds, root_id, meta_lock)
+
             total = time.perf_counter() - t0
 
             print(f"\n✅ Sync completed in {_fmt(total)}")

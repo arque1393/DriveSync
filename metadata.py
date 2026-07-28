@@ -25,6 +25,7 @@ def save_metadata(metadata: Dict) -> None:
     Either way the original file is never left in a half-written state.
     """
     target = Path(METADATA_FILE)
+    target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=target.parent, suffix='.tmp')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:

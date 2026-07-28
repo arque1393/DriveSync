@@ -37,11 +37,13 @@ import aiofiles.os
 from drive_api import DriveSession
 
 # ── Folder path cache (cleared every sync cycle) ─────────────────────────────
-_folder_cache: Dict[str, str] = {}
+_folder_cache: Dict[str, str]       = {}
+_folder_locks: Dict[str, asyncio.Lock] = {}
 
 
 def clear_folder_cache() -> None:
     _folder_cache.clear()
+    _folder_locks.clear()
 
 
 def _cache_key(root_id: str, parts: List[str]) -> str:
@@ -61,8 +63,9 @@ async def get_or_create_root_folder(
         print(f"📁 Using Drive folder: {meta['name']} (ID: {folder_id})")
         return folder_id
 
+    safe_name = folder_name.replace("'", "\\'")
     resp  = await ds.list_files(
-        q=(f"name='{folder_name}' and "
+        q=(f"name='{safe_name}' and "
            f"mimeType='application/vnd.google-apps.folder' and trashed=false"),
         fields='files(id,name)',
         corpora='user',
@@ -105,15 +108,30 @@ async def get_or_create_folder_path(
             parent_id = _folder_cache[key]
             continue
 
-        resp  = await ds.list_files(
-            q=(f"name='{name}' and '{parent_id}' in parents and "
-               f"mimeType='application/vnd.google-apps.folder' and trashed=false"),
-            fields='files(id)',
-            page_size=10,
-        )
-        files = resp.get('files', [])
-        parent_id = files[0]['id'] if files else await ds.create_folder(name, parent_id)
-        _folder_cache[key] = parent_id
+        # Serialize per-folder creation: without this, concurrent uploads into
+        # the same subfolder each miss the cache, each call list_files, all see
+        # "folder not found", and each call create_folder — producing duplicates.
+        # Lock creation is safe without its own lock because asyncio is
+        # single-threaded and there is no await between the check and the set.
+        if key not in _folder_locks:
+            _folder_locks[key] = asyncio.Lock()
+
+        async with _folder_locks[key]:
+            # Double-check: another coroutine may have created the folder while
+            # we were waiting for the lock.
+            if key in _folder_cache:
+                parent_id = _folder_cache[key]
+            else:
+                safe = name.replace("'", "\\'")
+                resp = await ds.list_files(
+                    q=(f"name='{safe}' and '{parent_id}' in parents and "
+                       f"mimeType='application/vnd.google-apps.folder' and trashed=false"),
+                    fields='files(id)',
+                    page_size=10,
+                )
+                files = resp.get('files', [])
+                parent_id = files[0]['id'] if files else await ds.create_folder(name, parent_id)
+                _folder_cache[key] = parent_id
 
     return parent_id
 
@@ -269,8 +287,9 @@ async def upload_file(
     for attempt in range(max_retries + 1):
         try:
             mtime  = (await aiofiles.os.stat(local_path)).st_mtime
+            safe_name = file_name.replace("'", "\\'")
             resp   = await ds.list_files(
-                q=f"name='{file_name}' and '{parent_id}' in parents and trashed=false",
+                q=f"name='{safe_name}' and '{parent_id}' in parents and trashed=false",
                 fields='files(id)',
                 page_size=10,
             )
