@@ -2,8 +2,16 @@
 """Google Drive Sync — bidirectional sync between a local folder and Google Drive."""
 
 import argparse
+import io
 import os
 import sys
+
+# Force UTF-8 stdout/stderr so emoji in print() don't crash on Windows terminals
+# that default to cp1252.  Must happen before any print() call.
+if hasattr(sys.stdout, 'buffer'):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'buffer'):
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 
 # ── Terminal colour helpers ───────────────────────────────────────────────────

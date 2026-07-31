@@ -31,6 +31,7 @@ races (both miss the cache, both query the API) but that's idempotent and rare.
 import asyncio
 import os
 import random
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import aiofiles.os
@@ -170,7 +171,7 @@ async def _scan_one_folder(
                     )
                     for f in resp.get('files', []):
                         name = f['name']
-                        path = os.path.join(prefix, name) if prefix else name
+                        path = (prefix + '/' + name) if prefix else name
                         if f['mimeType'] == 'application/vnd.google-apps.folder':
                             subfolders.append((f['id'], path))
                         else:
@@ -241,7 +242,7 @@ async def download_file(
     max_retries: int = 4,
 ) -> None:
     """Download with retry. Uses aiofiles for non-blocking disk writes."""
-    rel_path = os.path.relpath(local_path, local_folder)
+    rel_path = Path(local_path).relative_to(local_folder).as_posix()
 
     for attempt in range(max_retries + 1):
         try:

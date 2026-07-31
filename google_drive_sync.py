@@ -94,9 +94,11 @@ def _conflict_paths(rel_path: str, device_name: str):
     notes.excalidraw.md  → notes.excalidraw.local.HOSTNAME.md  /  notes.excalidraw.drive.md
     image.png            → image.local.HOSTNAME.png     /  image.drive.png
     """
-    p      = Path(rel_path)
-    stem   = p.stem        # everything before the last extension
-    ext    = p.suffix      # last extension only (e.g. '.md')
+    # Use PurePosixPath so rel keys stay forward-slash on every platform.
+    from pathlib import PurePosixPath
+    p      = PurePosixPath(rel_path)
+    stem   = p.stem
+    ext    = p.suffix
     parent = p.parent
 
     return (
@@ -119,8 +121,11 @@ def _find_uploads(local_files, metadata, local_folder):
     for rel in local_files:
         if rel == _METADATA_NAME:
             continue  # pushed to Drive separately after save_metadata
-        full         = str(Path(local_folder) / rel)
-        mtime        = os.path.getmtime(full)
+        full = str(Path(local_folder) / rel)
+        try:
+            mtime = os.path.getmtime(full)
+        except OSError:
+            continue  # file removed between scan and stat — skip silently
         # 'mtime or 0' converts None (ghost sentinel) to 0 without crashing
         stored_mtime = metadata['files'].get(rel, {}).get('mtime') or 0
         if mtime > stored_mtime:
@@ -473,7 +478,7 @@ class GoogleDriveSync:
 
         print(f"\n📋 {len(files_to_download)} file(s) queued to download:")
         for _, fname, lpath, _ in files_to_download:
-            print(f"   ↓  {os.path.relpath(lpath, LOCAL_FOLDER)}")
+            print(f"   ↓  {Path(lpath).relative_to(LOCAL_FOLDER).as_posix()}")
 
         sem = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
         t1  = time.perf_counter()
