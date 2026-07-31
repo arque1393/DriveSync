@@ -17,7 +17,7 @@ SERVICE_ACCOUNT_FILE = 'secrets/mydesktopsync-ecd639c07433.json'
 
 # ── Defaults (overridden by user_config.json when present) ───────────────────
 _DEFAULTS = {
-    'local_folder':       '/home/aritrarc1/GDrive',
+    'local_folder':       r'C:\Users\aritra.r.chowdhury\GDrive',
     'drive_folder_name':  'Obsidian',
     'drive_folder_id':    '',
     'sync_interval':      300,

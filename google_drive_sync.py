@@ -312,6 +312,27 @@ def _resolve_conflicts(conflicts, metadata, local_folder):
     return drive_downloads
 
 
+def _reconcile_metadata_with_drive(drive_files: dict, metadata: dict) -> None:
+    """Clear metadata entries for files no longer present in Drive.
+
+    Without this, a file deleted from Drive keeps its stored mtime entry.
+    On the next cycle _find_uploads sees local_mtime == stored_mtime and
+    skips the file — it never gets re-uploaded.  Clearing the entry makes
+    _find_uploads treat the file as new and queue it for upload.
+    """
+    drive_ids = {info['id'] for info in drive_files.values()}
+    to_clear = [
+        rel for rel, stored in metadata['files'].items()
+        if rel != _METADATA_NAME
+        and stored.get('drive_id')
+        and stored['drive_id'] not in drive_ids
+    ]
+    for rel in to_clear:
+        del metadata['files'][rel]
+    if to_clear:
+        print(f"   🔁 {len(to_clear)} file(s) removed from Drive — queued for re-upload")
+
+
 class GoogleDriveSync:
     """Bidirectional Google Drive sync — fully async internals."""
 
@@ -333,15 +354,17 @@ class GoogleDriveSync:
         ds: DriveSession,
         root_id: str,
         meta_lock: asyncio.Lock,
+        local_files=None,   # pre-scanned by _run_cycle; None → scan here
     ) -> dict:
         print("\n🔼 Checking for local changes to upload...")
 
-        # scan_local_files uses pathlib (sync) — run in thread so we don't
-        # block the event loop during directory traversal
-        t0          = time.perf_counter()
-        local_files = await asyncio.to_thread(scan_local_files, LOCAL_FOLDER)
-        t_scan      = time.perf_counter() - t0
-        print(f"   📂 Local scan:  {_fmt(t_scan)}  ({len(local_files)} files found)")
+        if local_files is None:
+            t0          = time.perf_counter()
+            local_files = await asyncio.to_thread(scan_local_files, LOCAL_FOLDER)
+            t_scan      = time.perf_counter() - t0
+            print(f"   📂 Local scan:  {_fmt(t_scan)}  ({len(local_files)} files found)")
+        else:
+            print(f"   📂 {len(local_files)} local files")
 
         # Batch all stat() calls into one thread — avoids 853 individual
         # event-loop blockages from os.path.getmtime in a comprehension.
@@ -351,7 +374,7 @@ class GoogleDriveSync:
 
         if not files_to_upload:
             print("✅ No local changes to upload")
-            return {'scan': t_scan, 'upload': 0.0}
+            return {'upload': 0.0}
 
         print(f"\n📋 {len(files_to_upload)} file(s) queued to upload:")
         for _, rel in files_to_upload:
@@ -380,7 +403,7 @@ class GoogleDriveSync:
             for f in failed:
                 print(f"   ✗  {f}")
 
-        return {'scan': t_scan, 'upload': t_upload}
+        return {'upload': t_upload}
 
     # ── sync_down ─────────────────────────────────────────────────────────────
 
@@ -389,15 +412,19 @@ class GoogleDriveSync:
         ds: DriveSession,
         root_id: str,
         meta_lock: asyncio.Lock,
+        drive_files=None,   # pre-scanned by _run_cycle; None → scan here
     ) -> dict:
         print("\n🔽 Checking for Drive changes to download...")
 
-        t0          = time.perf_counter()
-        drive_files = await drive_ops.scan_drive_files(
-            ds, root_id, concurrency=SCAN_CONCURRENCY
-        )
-        t_scan = time.perf_counter() - t0
-        print(f"   ☁  Drive scan:  {_fmt(t_scan)}  ({len(drive_files)} files indexed)")
+        if drive_files is None:
+            t0          = time.perf_counter()
+            drive_files = await drive_ops.scan_drive_files(
+                ds, root_id, concurrency=SCAN_CONCURRENCY
+            )
+            t_scan = time.perf_counter() - t0
+            print(f"   ☁  Drive scan:  {_fmt(t_scan)}  ({len(drive_files)} files indexed)")
+        else:
+            print(f"   ☁  {len(drive_files)} Drive files")
 
         # Batch all exists()/getmtime() calls into one thread.
         files_to_download, conflicts, _ = await asyncio.to_thread(
@@ -442,7 +469,7 @@ class GoogleDriveSync:
 
         if not files_to_download:
             print("✅ No Drive changes to download")
-            return {'scan': t_scan, 'download': 0.0}
+            return {'download': 0.0}
 
         print(f"\n📋 {len(files_to_download)} file(s) queued to download:")
         for _, fname, lpath, _ in files_to_download:
@@ -471,44 +498,51 @@ class GoogleDriveSync:
             for f in failed:
                 print(f"   ✗  {f}")
 
-        return {'scan': t_scan, 'download': t_download}
+        return {'download': t_download}
 
     # ── metadata pre-pull / post-push ────────────────────────────────────────
 
     async def _pull_metadata_from_drive(
-        self, ds: DriveSession, root_id: str
+        self, ds: DriveSession, root_id: str, drive_files: dict | None = None
     ) -> dict | None:
         """Download Drive's metadata file if it is newer than our local copy.
 
-        Returns the drive file record dict {mtime, drive_id, drive_mtime} so
-        the caller can stitch it into self.metadata after reloading from disk,
-        or None if Drive has no newer version.
+        Accepts the pre-scanned drive_files dict to avoid an extra API call.
+        Returns {mtime, drive_id, drive_mtime} if downloaded, else None.
         """
-        stored            = self.metadata['files'].get(_METADATA_NAME)
+        stored             = self.metadata['files'].get(_METADATA_NAME)
         stored_drive_mtime = stored.get('drive_mtime') if stored else None
 
-        resp = await ds.list_files(
-            q=(f"name='{_METADATA_NAME}' and '{root_id}' in parents"
-               " and trashed=false"),
-            fields='files(id,name,modifiedTime)',
-            page_size=1,
-        )
-        files = resp.get('files', [])
-        if not files:
-            return None  # metadata not yet on Drive
+        if drive_files is not None:
+            # Use the pre-scanned results — no extra API round-trip needed.
+            if _METADATA_NAME not in drive_files:
+                return None
+            info        = drive_files[_METADATA_NAME]
+            drive_id    = info['id']
+            drive_mtime = info['mtime']
+        else:
+            resp = await ds.list_files(
+                q=(f"name='{_METADATA_NAME}' and '{root_id}' in parents"
+                   " and trashed=false"),
+                fields='files(id,name,modifiedTime)',
+                page_size=1,
+            )
+            files = resp.get('files', [])
+            if not files:
+                return None
+            drive_id    = files[0]['id']
+            drive_mtime = files[0]['modifiedTime']
 
-        drive_file  = files[0]
-        drive_mtime = drive_file['modifiedTime']
         if drive_mtime == stored_drive_mtime:
             return None  # Drive unchanged since last push
 
         local_path = Path(METADATA_FILE)
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        await ds.download(drive_file['id'], local_path)
+        await ds.download(drive_id, local_path)
         print("   📄 Pulled newer metadata from Drive — reloading state")
         return {
             'mtime':      local_path.stat().st_mtime,
-            'drive_id':   drive_file['id'],
+            'drive_id':   drive_id,
             'drive_mtime': drive_mtime,
         }
 
@@ -654,20 +688,32 @@ class GoogleDriveSync:
                     ds, DRIVE_FOLDER_NAME, folder_id=DRIVE_FOLDER_ID or None
                 )
 
-                # Pull Drive's metadata before syncing — if a newer copy exists
-                # (e.g. from another device) reload in-memory state so this
-                # cycle's decisions are based on the freshest known state.
-                drive_meta = await self._pull_metadata_from_drive(ds, root_id)
+                # Phase 1 — Scan both sides concurrently so neither waits on
+                # the other; this preserves the original concurrency benefit.
+                t_s0 = time.perf_counter()
+                local_files, drive_files = await asyncio.gather(
+                    asyncio.to_thread(scan_local_files, LOCAL_FOLDER),
+                    drive_ops.scan_drive_files(ds, root_id, concurrency=SCAN_CONCURRENCY),
+                )
+                t_scan = time.perf_counter() - t_s0
+                print(f"   📂 {len(local_files)} local  │  "
+                      f"☁  {len(drive_files)} Drive  [{_fmt(t_scan)}]")
+
+                # Phase 2 — Metadata sync.
+                # Pull Drive's copy if newer (e.g. another device synced first),
+                # then reconcile: clear entries for Drive-deleted files so they
+                # get re-uploaded instead of being silently skipped.
+                drive_meta = await self._pull_metadata_from_drive(ds, root_id, drive_files)
                 if drive_meta is not None:
                     self.metadata = await asyncio.to_thread(load_metadata)
                     self.metadata['files'][_METADATA_NAME] = drive_meta
+                _reconcile_metadata_with_drive(drive_files, self.metadata)
 
-                # sync_up and sync_down share the same DriveSession and run
-                # concurrently — they operate on disjoint file sets so the
-                # only shared state (self.metadata) is guarded by meta_lock.
+                # Phase 3 — Upload/download with pre-scanned file lists so
+                # neither method needs to repeat the scan.
                 up, down = await asyncio.gather(
-                    self.sync_up(ds, root_id, meta_lock),
-                    self.sync_down(ds, root_id, meta_lock),
+                    self.sync_up(ds, root_id, meta_lock, local_files),
+                    self.sync_down(ds, root_id, meta_lock, drive_files),
                 )
 
                 # Persist then push — both inside the session so the upload
@@ -678,9 +724,8 @@ class GoogleDriveSync:
             total = time.perf_counter() - t0
 
             print(f"\n✅ Sync completed in {_fmt(total)}")
-            print(f"   ⏱  local scan {_fmt(up['scan'])} │ "
-                  f"upload {_fmt(up['upload'])} │ "
-                  f"drive scan {_fmt(down['scan'])} │ "
+            print(f"   ⏱  scan {_fmt(t_scan)} │ "
+                  f"upload {_fmt(up.get('upload', 0.0))} │ "
                   f"download {_fmt(down.get('download', 0.0))}")
 
         except Exception as e:
