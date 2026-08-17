@@ -338,6 +338,32 @@ def _reconcile_metadata_with_drive(drive_files: dict, metadata: dict) -> None:
         print(f"   🔁 {len(to_clear)} file(s) removed from Drive — queued for re-upload")
 
 
+def _reconcile_metadata_with_local(local_files: set, metadata: dict) -> None:
+    """Clear metadata entries for files absent from the local folder.
+
+    Called only after reloading Drive's metadata onto a device that has never
+    synced (or has an empty/new local folder).  Without this, every Drive file
+    looks 'unchanged' (drive_mtime matches stored) so _find_downloads skips
+    them all and nothing is downloaded.  Clearing the entries makes those files
+    appear brand-new to _find_downloads so they get downloaded.
+
+    Ghost entries (mtime=None) are intentional conflict markers — left intact.
+    Regular entries with a matching local file are also left intact so
+    intentional local deletions on this device are still respected when the
+    metadata was NOT freshly pulled from Drive.
+    """
+    to_clear = [
+        rel for rel, stored in metadata['files'].items()
+        if rel != _METADATA_NAME
+        and stored.get('mtime') is not None   # skip ghost sentinels
+        and rel not in local_files
+    ]
+    for rel in to_clear:
+        del metadata['files'][rel]
+    if to_clear:
+        print(f"   🔁 {len(to_clear)} file(s) absent locally — queued for download")
+
+
 class GoogleDriveSync:
     """Bidirectional Google Drive sync — fully async internals."""
 
@@ -712,6 +738,12 @@ class GoogleDriveSync:
                 if drive_meta is not None:
                     self.metadata = await asyncio.to_thread(load_metadata)
                     self.metadata['files'][_METADATA_NAME] = drive_meta
+                    # Pulled from Drive → this may be a new/empty local folder.
+                    # Clear entries for locally-absent files so _find_downloads
+                    # treats them as new and downloads them.  Only safe here
+                    # because we just reloaded a foreign device's metadata —
+                    # there are no intentional local deletions to respect.
+                    _reconcile_metadata_with_local(local_files, self.metadata)
                 _reconcile_metadata_with_drive(drive_files, self.metadata)
 
                 # Phase 3 — Upload/download with pre-scanned file lists so
@@ -725,6 +757,10 @@ class GoogleDriveSync:
                 # can reuse the same aiohttp connection pool.
                 await asyncio.to_thread(save_metadata, self.metadata)
                 await self._push_metadata_to_drive(ds, root_id, meta_lock)
+                # Save again so the updated drive_mtime for sync_metadata.json
+                # (written by _push_metadata_to_drive) is on disk — prevents
+                # an unnecessary re-pull on the next --sync-once invocation.
+                await asyncio.to_thread(save_metadata, self.metadata)
 
             total = time.perf_counter() - t0
 
