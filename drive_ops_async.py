@@ -166,7 +166,7 @@ async def _scan_one_folder(
                 while True:
                     resp = await ds.list_files(
                         q=f"'{folder_id}' in parents and trashed=false",
-                        fields='nextPageToken,files(id,name,mimeType,modifiedTime)',
+                        fields='nextPageToken,files(id,name,mimeType,modifiedTime,size)',
                         page_token=page_token,
                     )
                     for f in resp.get('files', []):
@@ -176,9 +176,10 @@ async def _scan_one_folder(
                             subfolders.append((f['id'], path))
                         else:
                             files[path] = {
-                                'id':   f['id'],
+                                'id':    f['id'],
                                 'mtime': f.get('modifiedTime'),
-                                'name': name,
+                                'name':  name,
+                                'size':  int(f['size']) if 'size' in f else -1,
                             }
                     page_token = resp.get('nextPageToken')
                     if not page_token:

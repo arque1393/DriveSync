@@ -21,13 +21,9 @@ _DEFAULTS = {
     'drive_folder_name':  'Obsidian',
     'drive_folder_id':    '',
     'sync_interval':      300,
-    # ── Thread-pool knobs (legacy sync path) ────────────────────────────────
-    'scan_workers':       10,
-    'download_workers':   3,
     'download_retries':   4,
-    # ── Async concurrency knobs (asyncio path) ───────────────────────────────
-    # These cap how many coroutines can be awaiting a network call at once.
-    # Raising them speeds up large vaults; lower them on unstable connections.
+    # Async concurrency knobs — cap how many coroutines await a network call.
+    # Raise for faster sync on fast connections; lower on unstable ones.
     'scan_concurrency':   30,   # concurrent folder-listing requests
     'upload_concurrency': 5,    # concurrent file uploads
     'download_concurrency': 5,  # concurrent file downloads
@@ -51,12 +47,7 @@ METADATA_FILE     = os.path.join(LOCAL_FOLDER, 'sync_metadata.json')
 DRIVE_FOLDER_NAME = _user.get('drive_folder_name', _DEFAULTS['drive_folder_name'])
 DRIVE_FOLDER_ID   = _user.get('drive_folder_id',   _DEFAULTS['drive_folder_id'])
 SYNC_INTERVAL     = _user.get('sync_interval',     _DEFAULTS['sync_interval'])
-SCAN_WORKERS      = _user.get('scan_workers',      _DEFAULTS['scan_workers'])
-DOWNLOAD_WORKERS  = _user.get('download_workers',  _DEFAULTS['download_workers'])
 DOWNLOAD_RETRIES      = _user.get('download_retries',      _DEFAULTS['download_retries'])
 SCAN_CONCURRENCY      = _user.get('scan_concurrency',      _DEFAULTS['scan_concurrency'])
 UPLOAD_CONCURRENCY    = _user.get('upload_concurrency',    _DEFAULTS['upload_concurrency'])
 DOWNLOAD_CONCURRENCY  = _user.get('download_concurrency',  _DEFAULTS['download_concurrency'])
-
-# Legacy alias — sync path thread workers
-MAX_WORKERS = SCAN_WORKERS

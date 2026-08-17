@@ -587,24 +587,37 @@ def run_setup() -> Optional[dict]:
     _make_button(id_btn_row, 'Browse Drive…', _browse_drive,
                  accent=True, side='left')
 
-    # ── Sync interval + Max workers ───────────────────────────
+    # ── Sync interval ─────────────────────────────────────────
+    _section_label(body, '⏱   Sync Interval (s)')
+    interval_var = tk.IntVar(value=existing.get('sync_interval', 300))
+    _make_spinbox(body, interval_var, 30, 86400)
+
+    # ── Async concurrency knobs ───────────────────────────────
+    _section_label_with_hint(body, '⚡  Concurrency', 'scan / upload / download — raise for faster sync on good connections')
     cols = tk.Frame(body, bg=C['base'])
     cols.pack(fill='x', pady=(4, 0))
     cols.columnconfigure(0, weight=1, uniform='col')
     cols.columnconfigure(1, weight=1, uniform='col')
+    cols.columnconfigure(2, weight=1, uniform='col')
 
-    left  = tk.Frame(cols, bg=C['base'])
-    left.grid(row=0, column=0, sticky='nsew', padx=(0, 10))
-    right = tk.Frame(cols, bg=C['base'])
-    right.grid(row=0, column=1, sticky='nsew')
+    c0 = tk.Frame(cols, bg=C['base'])
+    c0.grid(row=0, column=0, sticky='nsew', padx=(0, 6))
+    c1 = tk.Frame(cols, bg=C['base'])
+    c1.grid(row=0, column=1, sticky='nsew', padx=(0, 6))
+    c2 = tk.Frame(cols, bg=C['base'])
+    c2.grid(row=0, column=2, sticky='nsew')
 
-    _section_label(left,  '⏱   Sync Interval (s)')
-    interval_var = tk.IntVar(value=existing.get('sync_interval', 300))
-    _make_spinbox(left, interval_var, 30, 86400)
+    _section_label(c0, 'Scan')
+    scan_var = tk.IntVar(value=existing.get('scan_concurrency', 30))
+    _make_spinbox(c0, scan_var, 1, 100)
 
-    _section_label(right, '⚡  Max Workers')
-    workers_var = tk.IntVar(value=existing.get('max_workers', 10))
-    _make_spinbox(right, workers_var, 1, 50)
+    _section_label(c1, 'Upload')
+    upload_var = tk.IntVar(value=existing.get('upload_concurrency', 5))
+    _make_spinbox(c1, upload_var, 1, 20)
+
+    _section_label(c2, 'Download')
+    download_var = tk.IntVar(value=existing.get('download_concurrency', 5))
+    _make_spinbox(c2, download_var, 1, 20)
 
     # ── Status ────────────────────────────────────────────────
     status_var = tk.StringVar()
@@ -628,9 +641,11 @@ def run_setup() -> Optional[dict]:
         drive = drive_var.get().strip()
         try:
             interval = int(interval_var.get())
-            workers  = int(workers_var.get())
+            scan_c   = int(scan_var.get())
+            upload_c = int(upload_var.get())
+            dl_c     = int(download_var.get())
         except (tk.TclError, ValueError):
-            _set_status('⚠  Interval and workers must be whole numbers.', C['red'])
+            _set_status('⚠  All numeric fields must be whole numbers.', C['red'])
             return
         if not local:
             _set_status('⚠  Local folder path cannot be empty.', C['red']); return
@@ -640,15 +655,15 @@ def run_setup() -> Optional[dict]:
             _set_status('⚠  Drive folder name cannot be empty.', C['red']); return
         if not (30 <= interval <= 86400):
             _set_status('⚠  Interval must be between 30 and 86 400 s.', C['yellow']); return
-        if not (1 <= workers <= 50):
-            _set_status('⚠  Workers must be between 1 and 50.', C['yellow']); return
 
         cfg = {
-            'local_folder':      local,
-            'drive_folder_name': drive,
-            'drive_folder_id':   folder_id_var.get().strip(),
-            'sync_interval':     interval,
-            'max_workers':       workers,
+            'local_folder':        local,
+            'drive_folder_name':   drive,
+            'drive_folder_id':     folder_id_var.get().strip(),
+            'sync_interval':       interval,
+            'scan_concurrency':    max(1, min(100, scan_c)),
+            'upload_concurrency':  max(1, min(20, upload_c)),
+            'download_concurrency': max(1, min(20, dl_c)),
         }
         save_config(cfg)
         result[0] = cfg

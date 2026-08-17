@@ -9,6 +9,18 @@ _SKIP_NAMES: frozenset = frozenset({
     'Icon\r',                        # macOS custom folder icon
 })
 
+# Directories whose entire subtree is skipped.
+# Only truly non-user-data dirs are listed here.
+# App-managed dot dirs like .obsidian, .trash, .logseq etc. are intentionally
+# NOT listed — they are part of the vault and must be synced.
+_SKIP_DIRS: frozenset = frozenset({
+    '.git',           # version control history — never belongs on Drive
+    '__pycache__',    # Python bytecode cache
+    '.venv', 'venv',  # Python virtual environments
+    'node_modules',   # JS dependencies
+    '.mypy_cache', '.pytest_cache', '.ruff_cache', '.tox',  # dev tool caches
+})
+
 
 def get_drive_path(local_rel_path: str) -> List[str]:
     """Return the parent folder components of a relative path as a list."""
@@ -21,6 +33,9 @@ def scan_local_files(local_folder: str) -> Set[str]:
     result = set()
     for p in root.rglob('*'):
         if not p.is_file():
+            continue
+        # Skip files inside ignored directories.
+        if any(part in _SKIP_DIRS for part in p.parts):
             continue
         if p.name in _SKIP_NAMES:
             continue

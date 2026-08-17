@@ -35,7 +35,8 @@ def dim(t):    return _fmt(t, '2')
 def print_help() -> None:
     from config import (
         CREDS_FILE, TOKEN_FILE, SYNC_INTERVAL,
-        LOCAL_FOLDER, DRIVE_FOLDER_NAME, DRIVE_FOLDER_ID, MAX_WORKERS,
+        LOCAL_FOLDER, DRIVE_FOLDER_NAME, DRIVE_FOLDER_ID,
+        SCAN_CONCURRENCY, UPLOAD_CONCURRENCY, DOWNLOAD_CONCURRENCY,
     )
 
     token_status = '✅ saved' if os.path.exists(TOKEN_FILE) else '⚠️  not yet — browser needed on first run'
@@ -49,7 +50,7 @@ def print_help() -> None:
 {rule}
 
 {bold('USAGE')}
-  python main.py {cyan('<flag>')} {yellow('[--interval N]')}
+  python main.py {cyan('<flag>')} {yellow('[options]')}
 
   At least one flag is required. Running with no arguments shows
   this help.
@@ -66,17 +67,17 @@ def print_help() -> None:
   {yellow('--interval N')}         Override the sync interval for this session {dim('(seconds)')}
                          Saved default: {green(str(SYNC_INTERVAL) + ' s')}
   {yellow('--conflict-keep')} {dim('local|drive')}
-                         Conflict resolution policy when both sides changed:
-                           {green('local')}  — local file wins, Drive version discarded
-                           {green('drive')}  — Drive file wins, local file overwritten
-                           {dim('(omit)')} — keep both as .local.DEVICE and .drive copies {dim('(default)')}
+                         Conflict policy (only for files with genuinely different content):
+                           {green('drive')}  — Drive wins; local saved as .local.DEVICE backup {dim('(default)')}
+                           {green('local')}  — local wins; Drive version discarded
+                         Files with identical size are adopted silently (no copy made).
 
 {bold('CURRENT CONFIG')}  {dim('· change with --setup ·')}
   Local folder   {green(LOCAL_FOLDER)}
   Drive folder   {green(DRIVE_FOLDER_NAME)}
   Drive folder ID  {green(DRIVE_FOLDER_ID) if DRIVE_FOLDER_ID else yellow('(not set — name search used)')}
   Sync interval  {green(str(SYNC_INTERVAL) + ' s')}
-  Max workers    {green(str(MAX_WORKERS))}
+  Concurrency    {green(f'scan={SCAN_CONCURRENCY}  upload={UPLOAD_CONCURRENCY}  download={DOWNLOAD_CONCURRENCY}')}
 
 {bold('AUTH')}  {dim('· OAuth user credentials ·')}
   Credentials    {dim(CREDS_FILE)}
@@ -92,7 +93,6 @@ def print_help() -> None:
   {dim('python main.py --setup --run')}         Configure then start syncing
   {dim('python main.py --setup --sync-once')}   Configure then sync once
   {dim('python main.py --run --interval 60')}                  Sync every 60 seconds
-  {dim('python main.py --run --conflict-keep=drive')}         Drive always wins conflicts
   {dim('python main.py --sync-once --conflict-keep=local')}   Local always wins conflicts
 {rule}
 """)

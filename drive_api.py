@@ -68,8 +68,10 @@ class DriveSession:
     async def __aenter__(self) -> 'DriveSession':
         # limit=100 allows up to 100 concurrent connections to googleapis.com
         # ttl_dns_cache=300 caches DNS for 5 min — avoids repeated lookups
-        connector     = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300)
-        self._session = aiohttp.ClientSession(connector=connector)
+        connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300)
+        # 30 s to establish connection; 10 min total per request (large uploads)
+        timeout   = aiohttp.ClientTimeout(connect=30, total=600)
+        self._session = aiohttp.ClientSession(connector=connector, timeout=timeout)
         await self._ensure_token()
         return self
 
