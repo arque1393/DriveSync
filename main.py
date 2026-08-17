@@ -57,7 +57,9 @@ def print_help() -> None:
 
 {bold('FLAGS')}
   {cyan('--run')}          Start the continuous sync loop  {dim('(Ctrl+C to stop)')}
-  {cyan('--sync-once')}    Run a single sync cycle and exit
+  {cyan('--sync-once')}    Run a single bidirectional sync cycle and exit
+  {cyan('--force-push')}   Upload ALL local files to Drive — local is authoritative
+                 {dim('No downloads; Drive becomes a copy of the local vault')}
   {cyan('--dry-run')}      Scan both sides and show what would change — nothing transferred
   {cyan('--setup')}        Open the GUI to configure folders
                  {dim('Combine with --run or --sync-once to sync after setup')}
@@ -107,6 +109,8 @@ def main() -> int:
     parser.add_argument('--run',            action='store_true')
     parser.add_argument('--sync-once',      action='store_true', dest='sync_once')
     parser.add_argument('--dry-run',        action='store_true', dest='dry_run')
+    parser.add_argument('--force-push',     action='store_true', dest='force_push',
+                        help='Upload ALL local files to Drive — local is authoritative, no downloads')
     parser.add_argument('--interval',       type=int, default=None,
                         metavar='N',
                         help='Sync interval in seconds (overrides saved config)')
@@ -116,7 +120,7 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    no_action = not any([args.setup, args.run, args.sync_once, args.dry_run])
+    no_action = not any([args.setup, args.run, args.sync_once, args.dry_run, args.force_push])
 
     if args.help or no_action:
         print_help()
@@ -144,6 +148,8 @@ def main() -> int:
 
         if args.dry_run:
             sync.preview()
+        elif args.force_push:
+            sync.force_push()
         elif args.sync_once:
             print('🔄 Running single sync...')
             sync.sync()

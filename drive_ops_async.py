@@ -281,21 +281,30 @@ async def upload_file(
     metadata_lock: asyncio.Lock,
     sem: asyncio.Semaphore,
     max_retries: int = 3,
+    known_id: Optional[str] = None,
 ) -> None:
-    """Upload with retry. Raises on final failure so gather() surfaces it."""
+    """Upload with retry. Raises on final failure so gather() surfaces it.
+
+    known_id: if the Drive file ID is already known (e.g. from a pre-scan),
+              skips the per-file list_files lookup — saves one API call per file.
+    """
     file_name = os.path.basename(local_path)
     parent_id = await get_or_create_folder_path(ds, drive_root_id, folder_path)
 
     for attempt in range(max_retries + 1):
         try:
-            mtime  = (await aiofiles.os.stat(local_path)).st_mtime
-            safe_name = file_name.replace("'", "\\'")
-            resp   = await ds.list_files(
-                q=f"name='{safe_name}' and '{parent_id}' in parents and trashed=false",
-                fields='files(id)',
-                page_size=10,
-            )
-            existing_id = resp['files'][0]['id'] if resp.get('files') else None
+            mtime = (await aiofiles.os.stat(local_path)).st_mtime
+
+            if known_id is not None:
+                existing_id: Optional[str] = known_id
+            else:
+                safe_name = file_name.replace("'", "\\'")
+                resp = await ds.list_files(
+                    q=f"name='{safe_name}' and '{parent_id}' in parents and trashed=false",
+                    fields='files(id)',
+                    page_size=10,
+                )
+                existing_id = resp['files'][0]['id'] if resp.get('files') else None
 
             async with sem:
                 result = await ds.upload(local_path, file_name, parent_id, existing_id)

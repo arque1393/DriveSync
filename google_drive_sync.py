@@ -802,11 +802,130 @@ class GoogleDriveSync:
             import traceback
             traceback.print_exc()
 
+    # ── Force push (local → Drive, one-way) ──────────────────────────────────
+
+    async def _force_push_cycle(self) -> None:
+        """
+        Hard sync: upload every local file to Drive, local is authoritative.
+
+        Differences from a normal sync cycle
+        ─────────────────────────────────────
+        • ALL local files are uploaded, not just ones newer than stored mtime.
+        • Drive scan is used only to look up existing file IDs so Drive can
+          be updated in-place instead of creating duplicates.  No downloads.
+        • Drive-only files (not present locally) are listed but NOT deleted —
+          run --dry-run afterwards to verify, then remove manually if needed.
+        """
+        ts = datetime.now()
+        print(f"\n{'='*60}")
+        print(f"🔼 FORCE PUSH  (local → Drive)  —  local is authoritative")
+        print(f"   {ts.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'='*60}")
+
+        drive_ops.clear_folder_cache()
+        t0        = time.perf_counter()
+        meta_lock = asyncio.Lock()
+
+        try:
+            async with DriveSession(self.creds) as ds:
+                root_id = await drive_ops.get_or_create_root_folder(
+                    ds, DRIVE_FOLDER_NAME, folder_id=DRIVE_FOLDER_ID or None
+                )
+
+                # Phase 1 — scan both sides concurrently so we can reuse
+                # Drive file IDs (avoids one list_files query per upload).
+                t_s0 = time.perf_counter()
+                local_files, drive_files = await asyncio.gather(
+                    asyncio.to_thread(scan_local_files, LOCAL_FOLDER),
+                    drive_ops.scan_drive_files(ds, root_id, concurrency=SCAN_CONCURRENCY),
+                )
+                t_scan = time.perf_counter() - t_s0
+                print(f"\n   📂 Local: {len(local_files)} files  │  "
+                      f"☁  Drive: {len(drive_files)} files  [{_fmt(t_scan)}]")
+
+                # Phase 2 — build upload list (ALL local files, not just changed)
+                files_to_upload = []
+                for rel in sorted(local_files):
+                    if rel == _METADATA_NAME:
+                        continue
+                    full      = str(Path(LOCAL_FOLDER) / rel)
+                    known_id  = drive_files.get(rel, {}).get('id')   # None = new file
+                    files_to_upload.append((full, rel, known_id))
+
+                # Report Drive-only files (not deleted — just informational)
+                drive_only = sorted(
+                    r for r in drive_files
+                    if r not in local_files and r != _METADATA_NAME
+                )
+                if drive_only:
+                    print(f"\n   ℹ  {len(drive_only)} file(s) exist on Drive but NOT locally "
+                          f"(not deleted — remove manually if unwanted):")
+                    for r in drive_only[:10]:
+                        print(f"      ☁  {r}")
+                    if len(drive_only) > 10:
+                        print(f"      … and {len(drive_only) - 10} more")
+
+                if not files_to_upload:
+                    print("\n   No local files to push.")
+                    return
+
+                preview_limit = 20
+                print(f"\n📋 Pushing {len(files_to_upload)} local file(s) to Drive:")
+                for _, rel, kid in files_to_upload[:preview_limit]:
+                    tag = 'update' if kid else 'new'
+                    print(f"   ↑  {rel}  [{tag}]")
+                if len(files_to_upload) > preview_limit:
+                    print(f"   … and {len(files_to_upload) - preview_limit} more")
+
+                # Phase 3 — concurrent upload
+                sem = asyncio.Semaphore(UPLOAD_CONCURRENCY)
+                t_u0 = time.perf_counter()
+
+                results = await asyncio.gather(
+                    *[drive_ops.upload_file(
+                        ds, root_id, full, rel, get_drive_path(rel),
+                        self.metadata, meta_lock, sem,
+                        known_id=kid,
+                    ) for full, rel, kid in files_to_upload],
+                    return_exceptions=True,
+                )
+
+                failed   = [files_to_upload[i][1] for i, r in enumerate(results)
+                            if isinstance(r, Exception)]
+                uploaded = len(files_to_upload) - len(failed)
+                t_upload = time.perf_counter() - t_u0
+
+                print(f"\n✅ Pushed {uploaded}/{len(files_to_upload)} file(s)  "
+                      f"[{_fmt(t_upload)}]")
+                if failed:
+                    print(f"⚠️  {len(failed)} upload(s) failed:")
+                    for f in failed:
+                        print(f"   ✗  {f}")
+
+                # Phase 4 — persist metadata and push it to Drive
+                await asyncio.to_thread(save_metadata, self.metadata)
+                await self._push_metadata_to_drive(ds, root_id, meta_lock)
+                await asyncio.to_thread(save_metadata, self.metadata)
+
+            total = time.perf_counter() - t0
+            print(f"\n✅ Force push completed in {_fmt(total)}")
+            if drive_only:
+                print(f"   ℹ  {len(drive_only)} Drive-only file(s) were left untouched")
+
+        except Exception as e:
+            print(f"\n❌ Force push failed: {e}")
+            import traceback
+            traceback.print_exc()
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def preview(self) -> None:
         """Show pending changes without transferring anything (--dry-run)."""
         asyncio.run(self._preview_cycle())
+
+    def force_push(self) -> None:
+        """Push ALL local files to Drive — local is authoritative (--force-push)."""
+        asyncio.run(self._force_push_cycle())
 
     def sync(self) -> None:
         """Run one sync cycle and return (used by --sync-once)."""
